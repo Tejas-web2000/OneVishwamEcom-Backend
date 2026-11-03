@@ -14,26 +14,55 @@ const garmentSchema = new mongoose.Schema({
   priceSuffix: { type: String, default: '', trim: true },
   description: { type: String, maxlength: 5000 },
   images: { type: [String], default: [] },
-  video: { type: String, default: '', trim: true },
   videoUrl: { type: String, default: '', trim: true },
-  videos: { type: [String], default: [] },
   documents: { type: [String], default: [] },
   pdfUrl: { type: String, default: '' },
   brochure: { type: String, default: '' },
   brand: { type: String, trim: true },
   gender: { type: String, enum: ['male', 'female', 'unisex'], default: 'unisex' },
   quantity: { type: Number, default: 1, min: 0 },
-  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  lister: { type: mongoose.Schema.Types.ObjectId, ref: 'Lister', index: true },
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Lister', index: true },
   availabilityStatus: { type: String, enum: ['available', 'sold_out', 'inactive'], default: 'available', index: true },
   status: { type: String, enum: ['available', 'sold', 'out-of-stock', 'pending', 'approved', 'changes-required', 'cancelled'], default: 'available', index: true },
-}, { timestamps: true, toJSON: { virtuals: true }, toObject: { virtuals: true } });
+  isBulkListing: { type: Boolean, default: false, index: true },
+  bulkBatchId: { type: String, trim: true, index: true },
+  bulkFilename: { type: String, trim: true },
+  bulkUploadedAt: { type: Date },
+}, {
+  timestamps: true,
+  toJSON: {
+    virtuals: true,
+    transform: (doc, ret) => {
+      delete ret.__v;
+      ret.lister = ret.lister || ret.createdBy;
+      ret.user = ret.createdBy;
+      return ret;
+    },
+  },
+  toObject: { virtuals: true },
+});
+
+garmentSchema.virtual('lister', {
+  ref: 'Lister',
+  localField: 'createdBy',
+  foreignField: '_id',
+  justOne: true,
+});
+
+garmentSchema.virtual('user').get(function () {
+  return this.createdBy;
+});
 
 garmentSchema.index({ category: 1, subcategory: 1 });
 garmentSchema.index({ createdAt: -1 });
 garmentSchema.index({ name: 'text', description: 'text', brand: 'text' });
 
 garmentSchema.pre('save', function (next) {
+  if (!this.videoUrl && this.video) this.videoUrl = this.video;
+  if (!this.videoUrl && Array.isArray(this.videos) && this.videos[0]) this.videoUrl = this.videos[0];
+  this.video = undefined;
+  this.videos = undefined;
+
   if (this.isModified('price') || this.isNew) {
     this.numericPrice = parsePrice(this.price);
   }

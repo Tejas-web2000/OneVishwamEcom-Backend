@@ -13,9 +13,7 @@ const grocerySchema = new mongoose.Schema({
   stock: { type: Number, default: 0, min: 0 },
   description: { type: String, maxlength: 2000 },
   images: { type: [String], default: [] },
-  video: { type: String, default: '', trim: true },
   videoUrl: { type: String, default: '', trim: true },
-  videos: { type: [String], default: [] },
   documents: { type: [String], default: [] },
   pdfUrl: { type: String, default: '' },
   brochure: { type: String, default: '' },
@@ -23,17 +21,48 @@ const grocerySchema = new mongoose.Schema({
   brand: { type: String, trim: true },
   organic: { type: Boolean, default: false },
   discount: { type: Number, default: 0, min: 0, max: 100 },
-  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  lister: { type: mongoose.Schema.Types.ObjectId, ref: 'Lister', index: true },
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Lister', index: true },
   availabilityStatus: { type: String, enum: ['available', 'sold_out', 'inactive'], default: 'available', index: true },
   status: { type: String, enum: ['available', 'out-of-stock', 'discontinued', 'pending', 'approved', 'changes-required', 'cancelled'], default: 'available', index: true },
-}, { timestamps: true, toJSON: { virtuals: true }, toObject: { virtuals: true } });
+  isBulkListing: { type: Boolean, default: false, index: true },
+  bulkBatchId: { type: String, trim: true, index: true },
+  bulkFilename: { type: String, trim: true },
+  bulkUploadedAt: { type: Date },
+}, {
+  timestamps: true,
+  toJSON: {
+    virtuals: true,
+    transform: (doc, ret) => {
+      delete ret.__v;
+      ret.lister = ret.lister || ret.createdBy;
+      ret.user = ret.createdBy;
+      return ret;
+    },
+  },
+  toObject: { virtuals: true },
+});
+
+grocerySchema.virtual('lister', {
+  ref: 'Lister',
+  localField: 'createdBy',
+  foreignField: '_id',
+  justOne: true,
+});
+
+grocerySchema.virtual('user').get(function () {
+  return this.createdBy;
+});
 
 grocerySchema.index({ name: 1, category: 1 });
 grocerySchema.index({ createdAt: -1 });
 grocerySchema.index({ name: 'text', description: 'text', brand: 'text' });
 
 grocerySchema.pre('save', function (next) {
+  if (!this.videoUrl && this.video) this.videoUrl = this.video;
+  if (!this.videoUrl && Array.isArray(this.videos) && this.videos[0]) this.videoUrl = this.videos[0];
+  this.video = undefined;
+  this.videos = undefined;
+
   if (this.isModified('price') || this.isNew) {
     this.numericPrice = parsePrice(this.price);
   }

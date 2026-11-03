@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const ApiResponse = require('../utils/ApiResponse');
 const ApiError = require('../utils/ApiError');
 const asyncHandler = require('../utils/asyncHandler');
@@ -8,6 +9,8 @@ const modules = require('../modules');
 const Lister = require('../models/Lister');
 const { parsePrice } = require('../utils/priceUtils');
 const { deleteMultipleMediaFromStorage } = require('../utils/firebaseStorage');
+const { normalizeCanonicalPropertyType } = require('../models/Property');
+const { recordProductAddition } = require('../services/announcementService');
 
 // ─── Auth ───────────────────────────────────────────────────────────────────
 
@@ -110,19 +113,11 @@ const refresh = asyncHandler(async (req, res) => {
 
 // ─── Listing Management ─────────────────────────────────────────────────────
 
-const CATEGORY_TO_MODULE = {
-  properties: 'properties',
-  'real-estate': 'properties',
-  vehicle: 'vehicles',
-  grocery: 'groceries',
-  garment: 'garments',
-  jewellery: 'jewellery',
-  finance: 'finance',
-  service: 'properties',
-};
+const { CATEGORY_TO_MODULE, findModule: lookupModule, normalizeCategory } = require('../config/constants');
 
 function findModule(type) {
-  const mod = modules.find((m) => m.id === type);
+  if (!type) throw new ApiError(400, 'Listing type is required');
+  const mod = lookupModule(type, false);
   if (!mod) throw new ApiError(400, `Unknown listing type "${type}"`);
   return mod;
 }
@@ -136,10 +131,14 @@ const getPendingListings = asyncHandler(async (req, res) => {
   let total = 0;
 
   await Promise.all(modules.map(async (mod) => {
-    if (category && CATEGORY_TO_MODULE[category] && CATEGORY_TO_MODULE[category] !== mod.id) return;
+    if (category && category !== 'all') {
+      const targetMod = normalizeCategory(category);
+      if (targetMod !== mod.id) return;
+    }
     try {
       const items = await mod.model
         .find({ status: 'pending' })
+        .populate('createdBy', 'name email phone listerId')
         .populate('lister', 'name email phone listerId')
         .sort({ createdAt: -1 })
         .skip((p - 1) * l)
@@ -164,10 +163,18 @@ const getAllListings = asyncHandler(async (req, res) => {
   let total = 0;
 
   await Promise.all(modules.map(async (mod) => {
-    if (category && CATEGORY_TO_MODULE[category] && CATEGORY_TO_MODULE[category] !== mod.id) return;
+    if (category && category !== 'all') {
+      const targetMod = normalizeCategory(category);
+      if (targetMod !== mod.id) return;
+    }
     const filter = {};
     if (status) filter.status = status;
-    if (listerId) filter.lister = listerId;
+    if (listerId) {
+      filter.$or = [
+        ...(mongoose.Types.ObjectId.isValid(listerId) ? [{ createdBy: listerId }, { lister: listerId }] : []),
+        { 'contributor.email': listerId }
+      ];
+    }
     if (search) {
       filter.$or = [
         { title: { $regex: search, $options: 'i' } },
@@ -178,6 +185,7 @@ const getAllListings = asyncHandler(async (req, res) => {
     try {
       const items = await mod.model
         .find(filter)
+        .populate('createdBy', 'name email phone listerId')
         .populate('lister', 'name email phone listerId')
         .sort({ createdAt: -1 })
         .skip((p - 1) * l)
@@ -186,13 +194,13 @@ const getAllListings = asyncHandler(async (req, res) => {
       if (items.length > 0) {
         results[mod.id] = items.map((item) => {
           const v = item.video || item.videoUrl || (Array.isArray(item.videos) && item.videos[0]) || '';
-          let listerObj = item.lister;
+          let listerObj = item.createdBy || item.lister;
           if (!listerObj || typeof listerObj !== 'object') {
             const fallbackName = item.contributor?.name || item.channelPartnerName || item.vendorName || 'Contributor';
             const fallbackEmail = item.contributor?.email || item.contactEmail || item.email || '';
             const fallbackPhone = item.contributor?.contact || item.contact || '';
             listerObj = {
-              _id: item.lister || item.user || item._id,
+              _id: item.createdBy || item.lister || item.user || item._id,
               name: fallbackName,
               email: fallbackEmail,
               phone: fallbackPhone,
@@ -209,6 +217,7 @@ const getAllListings = asyncHandler(async (req, res) => {
             ...item,
             lister: listerObj,
             contributor: contributorObj,
+            contributorId: listerObj._id || item.createdBy || item.lister,
             video: v,
             videoUrl: v,
             videos: Array.isArray(item.videos) && item.videos.length > 0 ? item.videos : (v ? [v] : []),
@@ -277,6 +286,38 @@ const getListingStats = asyncHandler(async (req, res) => {
     console.warn('⚠️ [ADMIN STATS]: User collection count failed:', err.message);
   }
 
+  // Exact aliases expected by Admin frontend
+  stats.totalListings = stats.total;
+  stats.pendingListings = stats.pending;
+  stats.approvedListings = stats.approved;
+  stats.cancelledListings = stats.cancelled;
+  stats.changesRequiredListings = stats['changes-required'];
+
+  try {
+    const VisitorCounter = require('../models/VisitorCounter');
+    const VisitorSession = require('../models/VisitorSession');
+    const d = new Date();
+    const today = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+    const counter = await VisitorCounter.findOne({ key: 'global' }).lean();
+    const activeThreshold = new Date(Date.now() - 45 * 1000);
+    const realActive = await VisitorSession.countDocuments({
+      isOnline: true,
+      lastSeenAt: { $gte: activeThreshold },
+    }).catch(() => 0);
+
+    const visitsToday = counter?.todayDate === today ? (counter?.todayHits || counter?.todayVisitors || 0) : 0;
+
+    stats.visitorStats = {
+      totalVisitors: counter?.totalVisitors || counter?.totalHits || 0,
+      totalHits: counter?.totalHits || counter?.totalVisitors || 0,
+      visitsToday: visitsToday || 0,
+      uniqueToday: counter?.todayVisitors || 0,
+      activeVisitors: Math.max(realActive, 1),
+    };
+  } catch (err) {
+    console.warn('⚠️ [ADMIN STATS]: Visitor counter fetch failed:', err.message);
+  }
+
   new ApiResponse(200, stats, 'Admin listing stats fetched').send(res);
 });
 
@@ -284,12 +325,19 @@ const getListingStats = asyncHandler(async (req, res) => {
 
 const getWebsiteUserStats = asyncHandler(async (req, res) => {
   const userRoleFilter = { role: { $ne: 'admin' } };
-  const [totalUsers, loggedInUsers, activeUsers, emailVerifiedUsers] = await Promise.all([
+  const [totalUsers, loggedInUsers, activeUsers, emailVerifiedUsers, durationAgg] = await Promise.all([
     User.countDocuments(userRoleFilter),
     User.countDocuments({ ...userRoleFilter, lastLogin: { $exists: true, $ne: null } }),
     User.countDocuments({ ...userRoleFilter, $or: [{ status: 'active' }, { accountStatus: 'active' }] }),
     User.countDocuments({ ...userRoleFilter, isEmailVerified: true }),
+    User.aggregate([
+      { $match: userRoleFilter },
+      { $group: { _id: null, totalSeconds: { $sum: '$totalTimeSpent' }, avgSeconds: { $avg: '$totalTimeSpent' } } },
+    ]).catch(() => []),
   ]);
+
+  const totalTimeSpentSeconds = durationAgg[0]?.totalSeconds || 0;
+  const avgTimeSpentSeconds = Math.round(durationAgg[0]?.avgSeconds || 0);
 
   new ApiResponse(
     200,
@@ -298,6 +346,8 @@ const getWebsiteUserStats = asyncHandler(async (req, res) => {
       loggedInUsers,
       activeUsers,
       emailVerifiedUsers,
+      totalTimeSpentSeconds,
+      avgTimeSpentSeconds,
     },
     'Website user stats fetched successfully'
   ).send(res);
@@ -317,6 +367,7 @@ const getWebsiteUsers = asyncHandler(async (req, res) => {
   if (search) {
     const searchRegex = { $regex: search, $options: 'i' };
     const searchConditions = [
+      { name: searchRegex },
       { fullName: searchRegex },
       { email: searchRegex },
       { mobile: searchRegex },
@@ -343,22 +394,74 @@ const getWebsiteUsers = asyncHandler(async (req, res) => {
     User.countDocuments(filter),
   ]);
 
-  const formattedUsers = users.map((u) => ({
-    _id: u._id,
-    name: u.fullName || u.email?.split('@')[0] || 'User',
-    email: u.email || 'N/A',
-    phone: u.phoneNumber || u.mobile || u.phone || 'N/A',
-    avatar: u.avatar || u.profileImage || '',
-    city: u.city || '',
-    area: u.area || '',
-    role: u.role || 'user',
-    isEmailVerified: Boolean(u.isEmailVerified),
-    status: u.status || u.accountStatus || 'active',
-    lastLogin: u.lastLogin || null,
-    createdAt: u.createdAt,
-  }));
+  const formattedUsers = users.map((u) => {
+    const resolvedName = u.name || u.fullName || u.email?.split('@')[0] || 'User';
+    return {
+      _id: u._id,
+      name: resolvedName,
+      fullName: resolvedName,
+      email: u.email || 'N/A',
+      phone: u.phoneNumber || u.mobile || u.phone || 'N/A',
+      avatar: u.profileImage || u.avatar || '',
+      profileImage: u.profileImage || u.avatar || '',
+      city: u.city || '',
+      area: u.area || '',
+      role: u.role || 'user',
+      isEmailVerified: Boolean(u.isEmailVerified),
+      status: u.status || u.accountStatus || 'active',
+      lastLogin: u.lastLogin || null,
+      lastActiveAt: u.lastActiveAt || u.updatedAt || u.lastLogin || null,
+      totalTimeSpent: u.totalTimeSpent || 0,
+      sessionDuration: u.sessionDuration || 0,
+      loginCount: u.loginCount || (u.lastLogin ? 1 : 0),
+      interests: u.interests || [],
+      primaryInterest: u.primaryInterest || '',
+      browsingHistory: (u.browsingHistory || []).slice(0, 10),
+      createdAt: u.createdAt,
+    };
+  });
 
   new ApiResponse(200, { users: formattedUsers, total, page: p, limit: l }, 'Website users fetched').send(res);
+});
+
+const getUserActivity = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  let user = null;
+  if (mongoose.Types.ObjectId.isValid(id)) {
+    user = await User.findById(id).select('-password -refreshToken').lean();
+  }
+  if (!user) {
+    user = await User.findOne({ $or: [{ email: id }, { firebaseUid: id }] }).select('-password -refreshToken').lean();
+  }
+  if (!user) throw new ApiError(404, 'User not found');
+
+  new ApiResponse(
+    200,
+    {
+      user: {
+        _id: user._id,
+        name: user.name || user.fullName || 'User',
+        email: user.email || 'N/A',
+        phone: user.phoneNumber || user.mobile || 'N/A',
+        avatar: user.avatar || user.profileImage || '',
+        city: user.city || '',
+        area: user.area || '',
+        pincode: user.pincode || '',
+        role: user.role || 'user',
+        status: user.status || user.accountStatus || 'active',
+        isEmailVerified: Boolean(user.isEmailVerified),
+        lastLogin: user.lastLogin,
+        lastActiveAt: user.lastActiveAt,
+        totalTimeSpent: user.totalTimeSpent || 0,
+        sessionDuration: user.sessionDuration || 0,
+        createdAt: user.createdAt,
+        primaryInterest: user.primaryInterest || '',
+        interests: user.interests || [],
+        browsingHistory: user.browsingHistory || [],
+      },
+    },
+    'User activity fetched'
+  ).send(res);
 });
 
 const getListingDetail = asyncHandler(async (req, res) => {
@@ -374,7 +477,7 @@ const getListingDetail = asyncHandler(async (req, res) => {
     const fallbackCity = item.contributor?.city || item.city || '';
 
     item.lister = {
-      _id: item.lister || item.user || item._id,
+      _id: item.createdBy || item.lister || item.user || item._id,
       name: fallbackName,
       email: fallbackEmail,
       phone: fallbackPhone,
@@ -445,11 +548,142 @@ const overrideListing = asyncHandler(async (req, res) => {
     }
   }
 
+  if (mod.id === 'properties') {
+    const rawType = updates.propertyType || updates.subcategory || item.propertyType || item.subcategory;
+    if (rawType) {
+      const canonicalType = normalizeCanonicalPropertyType(rawType);
+      updates.propertyType = canonicalType;
+      item.propertyType = canonicalType;
+      if (item.details && typeof item.details === 'object') {
+        item.details.propertyType = canonicalType;
+      }
+      if (updates.details && typeof updates.details === 'object') {
+        updates.details.propertyType = canonicalType;
+      }
+    }
+    delete updates.subcategory;
+    if (item.subcategory !== undefined) {
+      item.set('subcategory', undefined);
+    }
+    if (item._doc && 'subcategory' in item._doc) {
+      delete item._doc.subcategory;
+    }
+    item.markModified('propertyType');
+    item.markModified('details');
+  }
+
+  if (Array.isArray(updates.images)) {
+    const cleanImages = updates.images
+      .map((entry) => (typeof entry === 'string' ? entry.trim() : (entry?.url || entry?.src || '')))
+      .filter(Boolean)
+      .slice(0, 5);
+    item.images = cleanImages;
+    item.markModified('images');
+    if (item.details && typeof item.details === 'object') {
+      item.details.images = cleanImages;
+      item.markModified('details');
+    }
+  }
+
+  // Any edit in admin must NOT become pending status. Keep or set to 'approved'.
+  if (updates.status === 'pending' || !updates.status) {
+    if (item.status === 'pending' || item.status === 'changes-required' || item.status === 'approved' || !item.status) {
+      item.status = 'approved';
+      updates.status = 'approved';
+    } else {
+      updates.status = item.status;
+    }
+  } else {
+    item.status = updates.status;
+  }
+  item.adminComment = null;
+  item.markModified('status');
+
   Object.assign(item, updates);
+  if (Array.isArray(updates.images)) {
+    item.markModified('images');
+  }
   item.updatedAt = new Date();
   await item.save();
 
+  if (mod?.service?.cache) {
+    mod.service.cache.delete(String(id));
+  }
+
   new ApiResponse(200, { item }, 'Listing overridden successfully').send(res);
+});
+
+const reorderListingImages = asyncHandler(async (req, res) => {
+  const { type, id } = req.params;
+  const rawList = Array.isArray(req.body)
+    ? req.body
+    : Array.isArray(req.body.images)
+    ? req.body.images
+    : Array.isArray(req.body.reorderedImages)
+    ? req.body.reorderedImages
+    : null;
+
+  if (!rawList) {
+    throw new ApiError(400, 'Payload must be an array of images or an object containing an "images" array');
+  }
+
+  // Find target model
+  let targetMod = null;
+  let item = null;
+  if (type) {
+    targetMod = findModule(type);
+    item = await targetMod.model.findById(id);
+  } else {
+    for (const m of modules) {
+      if (!m?.model) continue;
+      const found = await m.model.findById(id);
+      if (found) {
+        targetMod = m;
+        item = found;
+        break;
+      }
+    }
+  }
+
+  if (!item) throw new ApiError(404, 'Listing not found');
+
+  // Parse and sort images based on position / index
+  let orderedUrls = [];
+  if (rawList.length > 0 && typeof rawList[0] === 'object' && rawList[0] !== null) {
+    // If elements have position or sort_order or order
+    const sorted = [...rawList].sort((a, b) => {
+      const posA = Number(a.position ?? a.order ?? a.sort_order ?? 0);
+      const posB = Number(b.position ?? b.order ?? b.sort_order ?? 0);
+      return posA - posB;
+    });
+    orderedUrls = sorted
+      .map((entry) => entry.url || entry.imageUrl || entry.image || entry.src || entry.imageId)
+      .filter((url) => typeof url === 'string' && url.trim().length > 0);
+  } else {
+    // Array of string URLs
+    orderedUrls = rawList
+      .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
+      .filter(Boolean);
+  }
+
+  // Enforce maximum 5 images
+  orderedUrls = orderedUrls.slice(0, 5);
+
+  item.images = orderedUrls;
+  if (item.details && typeof item.details === 'object' && Array.isArray(item.details.images)) {
+    item.details.images = orderedUrls;
+    item.markModified('details');
+  }
+  item.markModified('images');
+  item.updatedAt = new Date();
+  await item.save();
+
+  // Clear LRU cache if service exists
+  if (targetMod?.service?.cache) {
+    targetMod.service.cache.delete(String(id));
+  }
+
+  new ApiResponse(200, { item, images: item.images }, 'Images reordered successfully').send(res);
 });
 
 const updateListingStatus = asyncHandler(async (req, res) => {
@@ -490,8 +724,24 @@ const approveListing = asyncHandler(async (req, res) => {
 
   item.status = 'approved';
   item.adminComment = undefined;
+
+  const email = (item.contributor?.email || item.contactEmail || item.email || '').toLowerCase();
+  const partner = (item.channelPartnerName || item.vendorName || '').toLowerCase().replace(/\s+/g, '');
+  if (email === 'ceo@onevishwam.com' || item.origin === 'in_house_project' || partner === 'onevishwam') {
+    item.priority = 1;
+    item.isPriority = true;
+    item.featured = true;
+    item.origin = 'in_house_project';
+    item.channelPartnerName = 'One Vishwam';
+    item.vendorName = 'One Vishwam';
+  }
+
   item.updatedAt = new Date();
   await item.save();
+
+  recordProductAddition(type || 'properties', 1).catch((err) =>
+    console.error('Failed to log product announcement in approveListing:', err.message)
+  );
 
   new ApiResponse(200, { item }, 'Listing approved successfully').send(res);
 });
@@ -587,67 +837,123 @@ const getContributors = asyncHandler(async (req, res) => {
     listers = [];
   }
 
-  const listingContributorsMap = new Map();
+  const contributorsByEmail = new Map();
+  const contributorsById = new Map();
+
+  listers.forEach((l) => {
+    const norm = {
+      ...l,
+      _id: String(l._id),
+      id: String(l._id),
+      name: l.name || 'Contributor',
+      email: (l.email || '').trim().toLowerCase(),
+      phone: l.phone || l.listerId || '',
+      city: l.city || '',
+      type: l.role || 'lister',
+      createdAt: l.createdAt || new Date(),
+    };
+    if (norm._id) contributorsById.set(norm._id, norm);
+    if (norm.email) contributorsByEmail.set(norm.email, norm);
+  });
+
   await Promise.all(modules.map(async (mod) => {
     try {
       if (!mod || !mod.model) return;
-      const items = await mod.model.find({}, 'contributor lister user vendorName channelPartnerName status createdAt').lean();
+      const items = await mod.model.find({}, 'contributor createdBy lister user vendorName channelPartnerName status createdAt').lean();
       (items || []).forEach((item) => {
+        const idKey = String(item.createdBy || item.lister || item.user || '');
+        const emailKey = (item.contributor?.email || '').trim().toLowerCase();
+
+        if (idKey && contributorsById.has(idKey)) {
+          const existing = contributorsById.get(idKey);
+          if (!existing.phone && item.contributor?.contact) existing.phone = item.contributor.contact;
+          return;
+        }
+        if (emailKey && contributorsByEmail.has(emailKey)) {
+          const existing = contributorsByEmail.get(emailKey);
+          if (!existing.phone && item.contributor?.contact) existing.phone = item.contributor.contact;
+          return;
+        }
+
         if (item.contributor && (item.contributor.name || item.contributor.email)) {
-          const key = item.contributor.email || String(item.lister || item.user || item._id);
-          if (!listingContributorsMap.has(key)) {
-            listingContributorsMap.set(key, {
-              _id: item.lister || item.user || item._id,
-              name: item.contributor.name || item.channelPartnerName || item.vendorName || 'Contributor',
-              email: item.contributor.email || '',
-              phone: item.contributor.contact || '',
-              city: item.contributor.city || '',
-              type: item.contributor.type || 'lister',
-              createdAt: item.createdAt || new Date(),
-            });
-          }
+          const newContributor = {
+            _id: idKey || String(item._id),
+            id: idKey || String(item._id),
+            name: item.contributor.name || item.channelPartnerName || item.vendorName || 'Contributor',
+            email: emailKey,
+            phone: item.contributor.contact || item.contributor.phone || '',
+            city: item.contributor.city || '',
+            type: item.contributor.type || 'lister',
+            createdAt: item.createdAt || new Date(),
+          };
+          if (idKey) contributorsById.set(idKey, newContributor);
+          if (emailKey) contributorsByEmail.set(emailKey, newContributor);
         }
       });
     } catch {}
   }));
 
-  const map = new Map();
-  listers.forEach((l) => map.set(String(l._id || l.email), l));
-  listingContributorsMap.forEach((c, key) => {
-    if (!map.has(key)) map.set(key, c);
-  });
+  const seenIdentities = new Set();
+  const allContributors = [];
+  const candidateList = [...contributorsById.values(), ...contributorsByEmail.values()];
 
-  const allContributors = Array.from(map.values());
+  candidateList.forEach((c) => {
+    const key = (c.email || String(c._id || '')).toLowerCase();
+    if (!key || seenIdentities.has(key)) return;
+    seenIdentities.add(key);
+    allContributors.push(c);
+  });
 
   const enriched = await Promise.all(allContributors.map(async (lister) => {
     let totalListings = 0;
     let pendingCount = 0;
     let approvedCount = 0;
 
-    await Promise.all(modules.map(async (mod) => {
-      try {
-        if (!mod || !mod.model) return;
-        const filterOr = [
-          lister._id ? { lister: lister._id } : null,
-          lister._id ? { user: lister._id } : null,
-          lister.email ? { 'contributor.email': lister.email } : null,
-        ].filter(Boolean);
+    const orFilters = [];
+    if (lister._id && mongoose.Types.ObjectId.isValid(lister._id)) {
+      const objId = new mongoose.Types.ObjectId(lister._id);
+      orFilters.push(
+        { createdBy: objId },
+        { createdBy: String(objId) },
+        { lister: objId },
+        { lister: String(objId) },
+        { user: objId },
+        { user: String(objId) }
+      );
+    }
+    if (lister.email) {
+      orFilters.push({ 'contributor.email': lister.email });
+      orFilters.push({ 'contributor.email': lister.email.toLowerCase() });
+    }
+    if (lister.phone) {
+      orFilters.push({ 'contributor.phone': lister.phone });
+      orFilters.push({ 'contributor.contact': lister.phone });
+    }
+    if (lister.listerId) {
+      orFilters.push({ listerId: lister.listerId });
+      orFilters.push({ 'contributor.listerId': lister.listerId });
+    }
 
-        if (filterOr.length === 0) return;
-
-        const [total, pending, approved] = await Promise.all([
-          mod.model.countDocuments({ $or: filterOr }),
-          mod.model.countDocuments({ status: 'pending', $or: filterOr }),
-          mod.model.countDocuments({ status: 'approved', $or: filterOr }),
-        ]);
-        totalListings += total || 0;
-        pendingCount += pending || 0;
-        approvedCount += approved || 0;
-      } catch {}
-    }));
+    if (orFilters.length > 0) {
+      await Promise.all(modules.map(async (mod) => {
+        try {
+          if (!mod || !mod.model) return;
+          const [total, pending, approved] = await Promise.all([
+            mod.model.countDocuments({ $or: orFilters }),
+            mod.model.countDocuments({ status: 'pending', $or: orFilters }),
+            mod.model.countDocuments({ status: 'approved', $or: orFilters }),
+          ]);
+          totalListings += total || 0;
+          pendingCount += pending || 0;
+          approvedCount += approved || 0;
+        } catch {}
+      }));
+    }
 
     return {
       ...lister,
+      contact: lister.phone || lister.contact || '',
+      phone: lister.phone || lister.contact || '',
       totalListings,
       pendingCount,
       approvedCount,
@@ -661,34 +967,163 @@ const getContributorById = asyncHandler(async (req, res) => {
   const { id } = req.params;
   let lister = null;
   try {
-    lister = await Lister.findById(id).lean();
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      lister = await Lister.findById(id).lean();
+    }
+    if (!lister) {
+      lister = await Lister.findOne({ $or: [{ email: id }, { listerId: id }] }).lean();
+    }
   } catch {}
+
+  const orFilters = [];
+  if (mongoose.Types.ObjectId.isValid(id)) {
+    const objId = new mongoose.Types.ObjectId(id);
+    orFilters.push(
+      { createdBy: objId },
+      { createdBy: String(objId) },
+      { lister: objId },
+      { lister: String(objId) },
+      { user: objId },
+      { user: String(objId) }
+    );
+  }
+  if (lister?._id && mongoose.Types.ObjectId.isValid(lister._id)) {
+    const objId = new mongoose.Types.ObjectId(lister._id);
+    orFilters.push(
+      { createdBy: objId },
+      { createdBy: String(objId) },
+      { lister: objId },
+      { lister: String(objId) }
+    );
+  }
+  if (lister?.email) {
+    orFilters.push({ 'contributor.email': lister.email }, { 'contributor.email': lister.email.toLowerCase() });
+  } else if (id && id.includes('@')) {
+    orFilters.push({ 'contributor.email': id }, { 'contributor.email': id.toLowerCase() });
+  }
+  if (lister?.phone) {
+    orFilters.push({ 'contributor.phone': lister.phone }, { 'contributor.contact': lister.phone });
+  }
+  if (lister?.listerId) {
+    orFilters.push({ listerId: lister.listerId }, { 'contributor.listerId': lister.listerId });
+  }
 
   const listings = {};
   let totalListings = 0;
 
-  await Promise.all(modules.map(async (mod) => {
-    try {
-      if (!mod || !mod.model) return;
-      const items = await mod.model.find({ $or: [{ lister: id }, { user: id }] }).sort({ createdAt: -1 }).lean();
-      if (items && items.length > 0) {
-        listings[mod.id] = items;
-        totalListings += items.length;
-      }
-    } catch {}
-  }));
+  if (orFilters.length > 0) {
+    await Promise.all(modules.map(async (mod) => {
+      try {
+        if (!mod || !mod.model) return;
+        const items = await mod.model.find({ $or: orFilters }).sort({ createdAt: -1 }).lean();
+        if (items && items.length > 0) {
+          listings[mod.id] = items;
+          totalListings += items.length;
+        }
+      } catch {}
+    }));
+  }
 
   if (!lister) {
-    // Construct synthetic contributor profile from listing data if not in Lister model
     lister = {
       _id: id,
       name: 'Contributor',
-      email: '',
+      email: id.includes('@') ? id : '',
       phone: '',
+      contact: '',
+    };
+  } else {
+    lister = {
+      ...lister,
+      contact: lister.phone || lister.contact || '',
+      phone: lister.phone || lister.contact || '',
     };
   }
 
   new ApiResponse(200, { contributor: lister, listings, totalListings }, 'Contributor details fetched').send(res);
+});
+
+const getCategoryBreakdown = asyncHandler(async (req, res) => {
+  const { timeframe = 'all' } = req.query;
+  const now = new Date();
+  const lookupTimeframe = {};
+
+  if (timeframe === 'day') {
+    lookupTimeframe.visitedAt = { $gte: new Date(now.setHours(0, 0, 0, 0)) };
+  } else if (timeframe === 'week') {
+    const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    lookupTimeframe.visitedAt = { $gte: weekAgo };
+  } else if (timeframe === 'month') {
+    const monthAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    lookupTimeframe.visitedAt = { $gte: monthAgo };
+  }
+  // 'all' returns no time filter
+
+  const pipeline = [
+    { $match: lookupTimeframe },
+    {
+      $group: {
+        _id: '$category',
+        totalVisits: { $sum: 1 },
+        uniqueVisitors: { $addToSet: '$sessionIdentifier' },
+        firstVisit: { $min: '$visitedAt' },
+        lastVisit: { $max: '$visitedAt' },
+      },
+    },
+    { $sort: { totalVisits: -1 } },
+  ];
+
+  const categoryBreakdown = await Activity.aggregate(pipeline);
+
+  // Format the unique visitor count
+  const formatted = categoryBreakdown.map((item) => ({
+    category: item._id || 'unknown',
+    totalVisits: item.totalVisits || 0,
+    uniqueVisitors: item.uniqueVisitors ? item.uniqueVisitors.length : 0,
+    firstVisit: item.firstVisit || null,
+    lastVisit: item.lastVisit || null,
+  }));
+
+  new ApiResponse(200, { categoryBreakdown: formatted, timeframe }).send(res);
+});
+
+const getActivityStats = asyncHandler(async (req, res) => {
+  const { timeframe = 'all' } = req.query;
+  const now = new Date();
+  const lookup = {};
+
+  if (timeframe === 'day') {
+    lookup.visitedAt = { $gte: new Date(now.setHours(0, 0, 0, 0)) };
+  } else if (timeframe === 'week') {
+    const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    lookup.visitedAt = { $gte: weekAgo };
+  } else if (timeframe === 'month') {
+    const monthAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    lookup.visitedAt = { $gte: monthAgo };
+  }
+
+  const totalActivity = await Activity.countDocuments(lookup);
+
+  const categoryStats = await Activity.aggregate([
+    { $match: lookup },
+    {
+      $group: {
+        _id: '$category',
+        count: { $sum: 1 },
+      },
+    },
+    { $sort: { count: -1 } },
+  ]);
+
+  new ApiResponse(
+    200,
+    {
+      totalActivity,
+      categoryStats,
+      timeframe,
+    },
+    'Activity stats fetched'
+  ).send(res);
 });
 
 module.exports = {
@@ -702,6 +1137,7 @@ module.exports = {
   getListingDetail,
   updateListingStatus,
   overrideListing,
+  reorderListingImages,
   approveListing,
   requestChanges,
   cancelListing,
@@ -711,4 +1147,7 @@ module.exports = {
   getContributorById,
   getWebsiteUserStats,
   getWebsiteUsers,
+  getUserActivity,
+  getActivityStats,
+  getCategoryBreakdown,
 };

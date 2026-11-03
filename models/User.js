@@ -12,10 +12,14 @@ const userSchema = new mongoose.Schema(
       sparse: true,
       index: true,
     },
-    fullName: {
+    name: {
       type: String,
       trim: true,
       default: 'User',
+    },
+    fullName: {
+      type: String,
+      trim: true,
     },
     email: {
       type: String,
@@ -29,20 +33,9 @@ const userSchema = new mongoose.Schema(
     phoneNumber: {
       type: String,
       trim: true,
-    },
-    mobile: {
-      type: String,
-      required: false,
       unique: true,
       sparse: true,
-      trim: true,
-      match: [/^\+?[\d\s-]{10,15}$/, 'Please provide a valid mobile number'],
-    },
-    phone: {
-      type: String,
-      trim: true,
-      unique: true,
-      sparse: true,
+      index: true,
     },
     listerId: {
       type: String,
@@ -87,19 +80,64 @@ const userSchema = new mongoose.Schema(
       default: 'active',
     },
     lastLogin: { type: Date },
+    lastActiveAt: { type: Date },
+    totalTimeSpent: { type: Number, default: 0 },
+    sessionDuration: { type: Number, default: 0 },
+    loginCount: { type: Number, default: 0 },
     refreshToken: { type: String, select: false },
     resetPasswordToken: String,
     resetPasswordExpire: Date,
     savedListings: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Property' }],
+    interests: [
+      {
+        category: { type: String, required: true },
+        viewCount: { type: Number, default: 1 },
+        lastVisitedAt: { type: Date, default: Date.now },
+      },
+    ],
+    browsingHistory: [
+      {
+        category: { type: String, default: 'general' },
+        listingId: { type: String },
+        title: { type: String, default: '' },
+        price: { type: String, default: '' },
+        location: { type: String, default: '' },
+        image: { type: String, default: '' },
+        path: { type: String, default: '' },
+        visitedAt: { type: Date, default: Date.now },
+      },
+    ],
+    primaryInterest: { type: String, default: '' },
     notifications: {
       email: { type: Boolean, default: false },
       whatsapp: { type: Boolean, default: false },
     },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    toJSON: { virtuals: true },
+    toObject: { virtuals: true },
+  }
 );
 
+userSchema.virtual('mobile').get(function () {
+  return this.phoneNumber || '';
+});
+
+userSchema.virtual('phone').get(function () {
+  return this.phoneNumber || '';
+});
+
 userSchema.pre('save', async function (next) {
+  if (!this.name && this.fullName) {
+    this.name = this.fullName;
+  }
+  if (!this.fullName && this.name) {
+    this.fullName = this.name;
+  }
+  if (!this.phoneNumber && (this.mobile || this.phone)) {
+    this.phoneNumber = this.mobile || this.phone;
+  }
   if (!this.password || !this.isModified('password')) return next();
   const salt = await bcrypt.genSalt(BCRYPT_SALT_ROUNDS);
   this.password = await bcrypt.hash(this.password, salt);
@@ -126,12 +164,13 @@ userSchema.methods.generateRefreshToken = function () {
 };
 
 userSchema.methods.toProfileJSON = function () {
+  const resolvedName = this.name || this.fullName || 'User';
   return {
     id: this._id,
     firebaseUid: this.firebaseUid,
     accountType: this.role === 'lister' ? 'lister' : this.role === 'admin' ? 'admin' : 'user',
-    fullName: this.fullName,
-    name: this.fullName,
+    name: resolvedName,
+    fullName: resolvedName,
     email: this.email,
     phoneNumber: this.phoneNumber || this.mobile || this.phone || '',
     mobile: this.mobile || this.phoneNumber || '',
@@ -148,6 +187,10 @@ userSchema.methods.toProfileJSON = function () {
     accountStatus: this.accountStatus || this.status,
     status: this.status || this.accountStatus,
     lastLogin: this.lastLogin,
+    lastActiveAt: this.lastActiveAt,
+    totalTimeSpent: this.totalTimeSpent || 0,
+    sessionDuration: this.sessionDuration || 0,
+    loginCount: this.loginCount || 0,
     createdAt: this.createdAt,
     notifications: {
       email: this.notifications?.email ?? false,
@@ -157,13 +200,14 @@ userSchema.methods.toProfileJSON = function () {
 };
 
 userSchema.methods.toListerJSON = function () {
+  const resolvedName = this.name || this.fullName || 'User';
   return {
     id: this._id,
     firebaseUid: this.firebaseUid,
     accountType: 'lister',
     listerId: this.listerId || null,
-    name: this.fullName,
-    fullName: this.fullName,
+    name: resolvedName,
+    fullName: resolvedName,
     email: this.email,
     phone: this.phone || this.phoneNumber || this.mobile || null,
     phoneNumber: this.phoneNumber || this.phone || this.mobile || '',

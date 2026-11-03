@@ -13,23 +13,41 @@ const adminRoutes = require('./admin');
 const homepageRoutes = require('./homepage');
 const wishlistRoutes = require('../modules/wishlist/routes');
 const requirementRoutes = require('../modules/requirements/routes');
-const propertyModuleRoutes = require('../modules/properties/routes');
 const propertyRoutes = require('./propertyRoutes');
 const propertyRequirementRoutes = require('./propertyRequirements');
 const financeOfferingsRoutes = require('../modules/financeOfferings/routes');
+const bulkListingRoutes = require('./bulkListing');
+const visitorRoutes = require('./visitors');
+const announcementRoutes = require('./announcementRoutes');
 
 const router = express.Router();
 
+// Top Ribbon Announcements / Notifications
+router.use('/announcements', announcementRoutes);
+
+// Visitor Counter / Analytics
+router.use('/visitors', visitorRoutes);
+
+// Bulk intake
+router.use('/bulk-listing', bulkListingRoutes);
+
+// V1 compatibility endpoints
 router.use('/v1/auth', authRoutes);
 router.use('/v1/users', userRoutes);
 router.use('/v1/properties', propertyRoutes);
-router.use('/v1/properties', propertyModuleRoutes);
-router.use('/properties', propertyRoutes);
-router.use('/properties', propertyModuleRoutes);
-modules.filter(mod => mod.id !== 'properties').forEach(mod => router.use(`/${mod.id}`, mod.routes));
 router.use('/v1/property-requirements', propertyRequirementRoutes);
+
+// Standard API endpoints
+router.use('/properties', propertyRoutes);
+
+// Sector modules (vehicles, groceries, garments, jewellery, finance, electronics, bedding, etc.)
+modules
+  .filter((mod) => mod.id !== 'properties')
+  .forEach((mod) => router.use(`/${mod.id}`, mod.routes));
+
 router.use('/auth', authRoutes);
 router.use('/auth/lister', listerRoutes);
+router.use('/users', userRoutes);
 router.use('/admin', adminRoutes);
 router.use('/homepage', homepageRoutes);
 router.use('/product', productRoutes);

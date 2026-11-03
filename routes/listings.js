@@ -8,27 +8,8 @@ const { deleteMultipleMediaFromStorage } = require('../utils/firebaseStorage');
 
 const router = express.Router();
 
-// Maps the listing-admin "category" field to a backend module id.
-const CATEGORY_TO_MODULE = {
-  properties: 'properties',
-  'real-estate': 'properties',
-  vehicle: 'vehicles',
-  grocery: 'groceries',
-  garment: 'garments',
-  jewellery: 'jewellery',
-  finance: 'finance',
-  service: 'properties',
-  bedding: 'garments',
-  electronics: 'garments',
-};
-
-function findModule(type) {
-  let mod = modules.find((m) => m.id === type);
-  if (!mod) {
-    mod = modules.find((m) => m.id === 'properties') || modules[0];
-  }
-  return mod;
-}
+const { CATEGORY_TO_MODULE, findModule, normalizeCategory } = require('../config/constants');
+const { normalizeCanonicalPropertyType } = require('../models/Property');
 
 // Status constants
 const LISTER_ALLOWED_STATUSES = ['pending', 'changes-required'];
@@ -64,8 +45,8 @@ router.get('/', protect, asyncHandler(async (req, res) => {
   const isValidObjectId = (val) => val && mongoose.Types.ObjectId.isValid(String(val));
 
   const filterOr = [];
-  if (isValidObjectId(req.auth?.id)) filterOr.push({ lister: req.auth.id }, { user: req.auth.id });
-  if (isValidObjectId(req.user?._id)) filterOr.push({ lister: req.user._id }, { user: req.user._id });
+  if (isValidObjectId(req.auth?.id)) filterOr.push({ createdBy: req.auth.id }, { lister: req.auth.id }, { user: req.auth.id });
+  if (isValidObjectId(req.user?._id)) filterOr.push({ createdBy: req.user._id }, { lister: req.user._id }, { user: req.user._id });
   const listerIdVal = req.auth?.listerId || req.user?.listerId;
   if (listerIdVal) filterOr.push({ listerId: listerIdVal }, { lister_id: listerIdVal }, { 'details.listerId': listerIdVal });
   if (req.user?.phone) filterOr.push({ listerId: req.user.phone }, { lister_id: req.user.phone });
@@ -99,9 +80,23 @@ router.get('/', protect, asyncHandler(async (req, res) => {
   new ApiResponse(200, grouped, 'Listings fetched').send(res);
 }));
 
+const bulkListingController = require('../controllers/bulkListingController');
+
+// Bulk Listing Endpoints
+router.post('/bulk-upload', protect, bulkListingController.bulkUploadListings);
+router.post('/bulk/download-log', bulkListingController.recordTemplateDownloadLog);
+router.get('/bulk/download-logs', protect, adminOnly, bulkListingController.getTemplateDownloadLogs);
+router.get('/bulk/batches', protect, bulkListingController.getBulkBatches);
+router.get('/bulk/batches/:batchId', protect, bulkListingController.getBulkBatchById);
+router.post('/bulk/batches/:batchId/items', protect, bulkListingController.addItemToBatch);
+router.put('/bulk/batches/:batchId/items/:itemId', protect, bulkListingController.updateBatchItem);
+router.delete('/bulk/batches/:batchId/items/:itemId', protect, bulkListingController.deleteBatchItem);
+router.delete('/bulk/batches/:batchId', protect, bulkListingController.deleteBatch);
+
 // POST /api/listings  — create a listing owned by the authenticated account.
 router.post('/', protect, asyncHandler(async (req, res) => {
-  const type = req.body._type || CATEGORY_TO_MODULE[req.body.category] || req.body.category || 'properties';
+  const typeHint = req.body._type || req.body.categoryType || req.body.serviceType;
+  const type = normalizeCategory(typeHint || req.body.category) || 'properties';
   const mod = findModule(type);
 
   const body = { ...req.body };
@@ -114,14 +109,104 @@ router.post('/', protect, asyncHandler(async (req, res) => {
 
   const data = { ...body, status: 'pending' };
 
+  // Enforce maximum 5 images across all categories; direct web links bypass Firebase Storage
+  if (Array.isArray(data.images)) {
+    data.images = data.images.map((img) => (typeof img === 'string' ? img.trim() : '')).filter(Boolean).slice(0, 5);
+  }
+
+  // Normalize documents safely based on module expectations
+  if (Array.isArray(data.documents)) {
+    if (mod.id === 'properties') {
+      data.documents = data.documents.map((doc) => {
+        if (typeof doc === 'string') return { url: doc.trim(), filename: '', fileType: '' };
+        if (doc && typeof doc === 'object') return { url: (doc.url || doc.path || doc.src || '').trim(), filename: doc.filename || doc.name || '', fileType: doc.fileType || doc.type || '' };
+        return null;
+      }).filter((d) => d && d.url);
+    } else {
+      data.documents = data.documents.map((doc) => {
+        if (typeof doc === 'string') return doc.trim();
+        if (doc && typeof doc === 'object') return (doc.url || doc.path || doc.src || '').trim();
+        return '';
+      }).filter(Boolean);
+    }
+  }
+
+  if (mod.id === 'vehicles') {
+    if (!data.category || data.category === 'vehicle' || data.category === 'vehicles' || data.category === 'car') {
+      data.category = data.wheelerType || (data.subcategory === 'Bike' ? '2-wheeler' : data.subcategory === 'Auto Rickshaw' ? '3-wheeler' : data.subcategory === 'Commercial Vehicle' ? 'commercial' : '4-wheeler');
+    }
+    if (!data.wheelerType) {
+      data.wheelerType = data.category || '4-wheeler';
+    }
+    data.brand = data.brand || data.make || data.title?.split(' ')[0] || 'Generic';
+    data.model = data.model || data.title || 'Standard';
+    data.year = Number(data.year) || new Date().getFullYear();
+    data.price = String(data.price || data.numericPrice || 'Price on Request');
+    data.location = data.location || data.area || data.city || 'Bengaluru';
+  }
+
+  if (mod.id === 'properties') {
+    const rawType = body.propertyType || body.subcategory || data.propertyType || data.subcategory;
+    data.propertyType = normalizeCanonicalPropertyType(rawType);
+    delete data.subcategory;
+    delete body.subcategory;
+    data.vendorName = data.vendorName || data.channelPartnerName || req.user?.name || 'One Vishwam';
+    data.channelPartnerName = data.channelPartnerName || data.vendorName || req.user?.name || 'One Vishwam';
+    data.bankLoanDetails = data.bankLoanDetails || 'Available on request';
+  }
+
+  if (mod.id === 'garments') {
+    data.name = data.name || data.title || 'Apparel';
+    const validGarmentCategories = ['Men', 'Women', 'Kids', 'Unisex'];
+    if (!validGarmentCategories.includes(data.category)) {
+      const match = validGarmentCategories.find(c => c.toLowerCase() === String(data.category || data.gender || data.subcategory || '').toLowerCase());
+      data.category = match || 'Unisex';
+    }
+    data.price = String(data.price || data.numericPrice || '0');
+  }
+
+  if (mod.id === 'groceries') {
+    data.name = data.name || data.title || 'Grocery Product';
+    data.category = data.category && data.category !== 'grocery' && data.category !== 'groceries' ? data.category : (data.subcategory || 'General');
+    data.price = String(data.price || data.numericPrice || '0');
+  }
+
+  if (mod.id === 'jewellery') {
+    data.title = data.title || data.name || 'Jewellery';
+    data.name = data.name || data.title || 'Jewellery';
+    data.metalType = data.metalType || data.material || 'Gold';
+    data.category = data.category && data.category !== 'jewellery' && data.category !== 'jewelry' ? data.category : (data.subcategory || 'Necklace');
+    data.price = String(data.price || data.numericPrice || '0');
+  }
+
+  if (mod.id === 'electronics') {
+    data.title = data.title || data.name || 'Electronic Item';
+    data.brand = data.brand || data.make || 'Brand';
+    data.model = data.model || 'Model';
+    data.price = String(data.price || data.numericPrice || '0');
+  }
+
+  if (mod.id === 'bedding') {
+    data.title = data.title || data.name || 'Bedding Item';
+    data.brand = data.brand || 'Brand';
+    data.model = data.model || 'Model';
+    data.price = String(data.price || data.numericPrice || '0');
+  }
+
+  if (mod.id === 'finance') {
+    data.category = data.category || 'Loan';
+    data.companyName = data.companyName || data.vendorName || 'One Vishwam Finance';
+    data.description = data.description || data.title || 'Financial Service';
+    data.city = data.city || 'bengaluru';
+    data.contactEmail = data.contactEmail || userEmail || 'ceo@onevishwam.com';
+  }
+
   const mongoose = require('mongoose');
   const isValidObjectId = (val) => val && mongoose.Types.ObjectId.isValid(String(val));
   const ownerId = isValidObjectId(req.auth?.id)
     ? req.auth.id
     : (isValidObjectId(req.user?._id) ? req.user._id : new mongoose.Types.ObjectId());
 
-  data.user = ownerId;
-  data.lister = ownerId;
   data.createdBy = ownerId;
 
   // Server-side automatic identity resolution for One Vishwam vs External Listers
@@ -132,25 +217,19 @@ router.post('/', protect, asyncHandler(async (req, res) => {
     data.channelPartnerName = 'One Vishwam';
     data.vendorName = 'One Vishwam';
     data.origin = 'in_house_project';
+    data.priority = 1;
+    data.isPriority = true;
+    data.featured = true;
   } else {
-    data.channelPartnerName = data.channelPartnerName || req.user?.partnerName || req.auth?.partnerName || req.user?.fullName || req.user?.name || req.auth?.name || 'External Partner';
-    data.vendorName = data.vendorName || req.user?.fullName || req.user?.name || req.auth?.name || req.user?.partnerName || req.auth?.partnerName || 'Independent Owner';
-    data.origin = req.user?.origin || req.auth?.origin || 'channel_partner_project';
+    data.channelPartnerName = data.channelPartnerName || req.user?.name || 'External Partner';
+    data.vendorName = data.vendorName || req.user?.name || 'Independent Owner';
+    data.origin = req.user?.origin || 'channel_partner_project';
   }
 
   data.bankLoanDetails = data.bankLoanDetails || 'Available on request';
 
-  const contributorName =
-    req.user?.fullName ||
-    req.user?.name ||
-    req.auth?.name ||
-    body.contributor?.name ||
-    data.vendorName ||
-    data.channelPartnerName ||
-    (userEmail ? userEmail.split('@')[0] : '') ||
-    'Contributor';
-
-  const contributorPhone = req.user?.phone || req.user?.phoneNumber || req.user?.mobile || body.contributor?.contact || body.contact || '';
+  const contributorName = req.user?.name || body.contributor?.name || data.vendorName || 'Contributor';
+  const contributorPhone = req.user?.phone || body.contributor?.contact || body.contact || '';
   const contributorCity = req.user?.city || body.contributor?.city || body.city || '';
 
   data.contributor = {
@@ -165,9 +244,16 @@ router.post('/', protect, asyncHandler(async (req, res) => {
     createdAt: new Date(),
   };
 
+  // Clean redundant root fields from details if present
   if (data.details && typeof data.details === 'object') {
-    data.details.channelPartnerName = data.channelPartnerName;
-    data.details.vendorName = data.vendorName;
+    delete data.details.channelPartnerName;
+    delete data.details.vendorName;
+    delete data.details.propertyName;
+    delete data.details.expectedPrice;
+    delete data.details.description;
+    delete data.details.listerId;
+    delete data.details.possessionStatus;
+    delete data.details.negotiable;
   }
 
   const item = await mod.model.create(data);
@@ -175,7 +261,14 @@ router.post('/', protect, asyncHandler(async (req, res) => {
 }));
 
 function isOwnerOrAdmin(item, req) {
-  if (req.auth?.role === 'admin' || req.auth?.accountType === 'admin') return;
+  const isAdmin = Boolean(
+    req.auth?.role === 'admin' ||
+    req.auth?.role === 'super-admin' ||
+    req.auth?.accountType === 'admin' ||
+    req.user?.role === 'admin' ||
+    req.user?.role === 'super-admin'
+  );
+  if (isAdmin) return;
   const authId = req.auth?.id ? String(req.auth.id) : null;
   const userId = req.user?._id ? String(req.user._id) : null;
   const userEmail = req.auth?.email || req.user?.email || '';
@@ -205,6 +298,12 @@ router.get('/:type/:id', protect, asyncHandler(async (req, res) => {
   new ApiResponse(200, { item: normalizeListingItem(item) }, 'Listing fetched').send(res);
 }));
 
+const adminController = require('../controllers/adminController');
+
+// PATCH /api/listings/:type/:id/images/reorder — reorder images in batch
+router.patch('/:type/:id/images/reorder', protect, adminController.reorderListingImages);
+router.patch('/:id/images/reorder', protect, adminController.reorderListingImages);
+
 // PATCH /api/listings/:type/:id — update owned listing.
 router.patch('/:type/:id', protect, asyncHandler(async (req, res) => {
   const mod = findModule(req.params.type);
@@ -212,8 +311,16 @@ router.patch('/:type/:id', protect, asyncHandler(async (req, res) => {
   if (!item) throw new ApiError(404, 'Listing not found');
   isOwnerOrAdmin(item, req);
 
+  const isAdmin = Boolean(
+    req.auth?.role === 'admin' ||
+    req.auth?.role === 'super-admin' ||
+    req.auth?.accountType === 'admin' ||
+    req.user?.role === 'admin' ||
+    req.user?.role === 'super-admin'
+  );
+
   // Non-admins cannot edit cancelled listings
-  if (req.auth.role !== 'admin') {
+  if (!isAdmin) {
     canListerEdit(item, req);
   }
 
@@ -222,23 +329,105 @@ router.patch('/:type/:id', protect, asyncHandler(async (req, res) => {
   delete body.user;
   delete body.lister;
   delete body._type;
-  // Non-admins cannot change status directly
-  if (req.auth.role !== 'admin') {
+  // When a lister edits any product/listing, revert status to 'pending' so admin can review and approve it.
+  // When an admin edits anything, it should NOT become pending status; let it be in approved.
+  if (!isAdmin) {
+    item.status = 'pending';
+    item.adminComment = null;
+    item.markModified('status');
     delete body.status;
+  } else {
+    if (body.status === 'pending' || !body.status) {
+      if (item.status === 'pending' || item.status === 'changes-required' || item.status === 'approved' || !item.status) {
+        item.status = 'approved';
+        body.status = 'approved';
+      } else {
+        body.status = item.status;
+      }
+    } else {
+      item.status = body.status;
+    }
+    item.adminComment = null;
+    item.markModified('status');
+  }
+
+  // Enforce maximum 5 images across all categories; direct web links bypass Firebase Storage
+  if (Array.isArray(body.images)) {
+    const cleanImgs = body.images.map((img) => (typeof img === 'string' ? img.trim() : '')).filter(Boolean).slice(0, 5);
+    body.images = cleanImgs;
+    item.images = cleanImgs;
+    item.markModified('images');
+    if (item.details && typeof item.details === 'object') {
+      item.details.images = cleanImgs;
+      item.markModified('details');
+    }
+  }
+
+  // Normalize documents safely based on module expectations
+  if (Array.isArray(body.documents)) {
+    if (mod.id === 'properties') {
+      body.documents = body.documents.map((doc) => {
+        if (typeof doc === 'string') return { url: doc.trim(), filename: '', fileType: '' };
+        if (doc && typeof doc === 'object') return { url: (doc.url || doc.path || doc.src || '').trim(), filename: doc.filename || doc.name || '', fileType: doc.fileType || doc.type || '' };
+        return null;
+      }).filter((d) => d && d.url);
+    } else {
+      body.documents = body.documents.map((doc) => {
+        if (typeof doc === 'string') return doc.trim();
+        if (doc && typeof doc === 'object') return (doc.url || doc.path || doc.src || '').trim();
+        return '';
+      }).filter(Boolean);
+    }
   }
 
   const wasApproved = item.status === 'approved';
   const wasCancelled = item.status === 'cancelled' || item.status === 'rejected';
-  Object.assign(item, body);
 
-  // If user/lister edits a changes-required, cancelled, or approved listing, it goes back to pending for re-approval
-  if (req.auth.role !== 'admin' && (item.status === 'changes-required' || wasCancelled || wasApproved)) {
-    item.status = 'pending';
-    // Clear any previous admin comment when resubmitting
-    item.adminComment = undefined;
+  if (mod.id === 'properties') {
+    const rawType = body.propertyType || body.subcategory || item.propertyType || item.subcategory;
+    if (rawType) {
+      const canonicalType = normalizeCanonicalPropertyType(rawType);
+      body.propertyType = canonicalType;
+      item.propertyType = canonicalType;
+      if (item.details && typeof item.details === 'object') {
+        item.details.propertyType = canonicalType;
+      }
+      if (body.details && typeof body.details === 'object') {
+        body.details.propertyType = canonicalType;
+      }
+    }
+    delete body.subcategory;
+    if (item.subcategory !== undefined) {
+      item.set('subcategory', undefined);
+    }
+    if (item._doc && 'subcategory' in item._doc) {
+      delete item._doc.subcategory;
+    }
+    item.markModified('propertyType');
+    item.markModified('details');
+  }
+
+  Object.assign(item, body);
+  if (Array.isArray(body.images)) {
+    item.markModified('images');
+  }
+
+  // Enforce priority for in-house / ceo@onevishwam.com listings
+  const userEmail = (req.user?.email || req.auth?.email || '').toLowerCase();
+  const isOneVishwamUser = userEmail === 'ceo@onevishwam.com' || userEmail.endsWith('@onevishwam.com') || req.user?.role === 'in_house' || req.auth?.role === 'in_house';
+  if (isOneVishwamUser || item.origin === 'in_house_project') {
+    item.priority = 1;
+    item.isPriority = true;
+    item.featured = true;
+    item.origin = 'in_house_project';
+    item.channelPartnerName = 'One Vishwam';
+    item.vendorName = 'One Vishwam';
   }
 
   await item.save();
+  if (mod?.service?.cache) {
+    mod.service.cache.delete(String(req.params.id));
+  }
   new ApiResponse(200, { item: normalizeListingItem(item) }, 'Listing updated successfully').send(res);
 }));
 
@@ -282,9 +471,8 @@ router.get('/admin/all', protect, adminOnly, asyncHandler(async (req, res) => {
     const filter = {};
     if (status) filter.status = status;
     if (category && category !== 'all') {
-      // Check if category matches this module
-      const catToMod = Object.entries(CATEGORY_TO_MODULE).find(([, v]) => v === mod.id);
-      if (catToMod && catToMod[0] !== category) return;
+      const targetMod = normalizeCategory(category);
+      if (targetMod !== mod.id) return;
     }
     if (listerId) filter.lister = listerId;
     if (search) {
@@ -342,6 +530,12 @@ router.get('/admin/stats', protect, adminOnly, asyncHandler(async (req, res) => 
       }
     } catch { }
   }));
+
+  stats.totalListings = stats.total;
+  stats.pendingListings = stats.pending;
+  stats.approvedListings = stats.approved;
+  stats.cancelledListings = stats.cancelled;
+  stats.changesRequiredListings = stats['changes-required'];
 
   new ApiResponse(200, stats, 'Admin listing stats fetched').send(res);
 }));

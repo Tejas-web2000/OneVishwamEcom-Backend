@@ -1,14 +1,56 @@
 const mongoose = require('mongoose');
 
-const PROPERTY_TYPES = [
+const CANONICAL_PROPERTY_TYPES = [
   'Residential',
-  'Flat/Villa',
+  'Flat',
   'Independent House',
+  'Plot',
+  'Land',
   'Agricultural',
   'Commercial',
-  'Plot/Land',
   'Industrial',
 ];
+
+const PROPERTY_TYPES = [
+  ...CANONICAL_PROPERTY_TYPES,
+  'Flat / Villa',
+  'Flat/Villa',
+  'Plot / Land',
+  'Plot/Land',
+  'Villa',
+];
+
+function normalizeCanonicalPropertyType(val) {
+  if (!val || typeof val !== 'string' || !val.trim()) return 'Plot';
+  const str = String(val).trim().toLowerCase();
+  if (
+    str === 'flat/villa' ||
+    str === 'flat / villa' ||
+    str === 'flat' ||
+    str.includes('flat') ||
+    str.includes('apartment') ||
+    str.includes('villa')
+  ) {
+    return 'Flat';
+  }
+  if (
+    str === 'plot/land' ||
+    str === 'plot / land' ||
+    str.includes('plot') ||
+    str.includes('layout') ||
+    str.includes('plat') ||
+    str.includes('site')
+  ) {
+    return 'Plot';
+  }
+  if (str.includes('land') && !str.includes('agri')) return 'Land';
+  if (str.includes('independent') || str.includes('house')) return 'Independent House';
+  if (str.includes('agri') || str.includes('farm') || str.includes('plantation')) return 'Agricultural';
+  if (str.includes('commercial') || str.includes('shop') || str.includes('office') || str.includes('retail') || str.includes('showroom')) return 'Commercial';
+  if (str.includes('indus') || str.includes('factory') || str.includes('warehouse') || str.includes('shed')) return 'Industrial';
+  if (str.includes('residen')) return 'Residential';
+  return 'Plot';
+}
 
 const PROPERTY_STATUSES = [
   'pending',
@@ -160,12 +202,13 @@ const propertySchema = new mongoose.Schema(
         values: PROPERTY_TYPES,
         message: '{VALUE} is not a supported propertyType',
       },
+      set: (v) => normalizeCanonicalPropertyType(v),
       index: true,
     },
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
-      required: [true, 'Creator User reference is required'],
+      ref: 'Lister',
+      required: [true, 'Creator Lister reference is required'],
       index: true,
     },
     status: {
@@ -178,6 +221,11 @@ const propertySchema = new mongoose.Schema(
       type: String,
       trim: true,
       default: '',
+      index: true,
+    },
+    priority: {
+      type: Number,
+      default: 0,
       index: true,
     },
 
@@ -204,26 +252,30 @@ const propertySchema = new mongoose.Schema(
     documents: {
       type: [documentItemSchema],
       default: [],
+      set: (docs) => {
+        if (!Array.isArray(docs)) return [];
+        return docs
+          .map((doc) => {
+            if (typeof doc === 'string') {
+              return { url: doc.trim(), filename: '', fileType: '' };
+            }
+            if (doc && typeof doc === 'object') {
+              return {
+                url: (doc.url || doc.path || doc.src || '').trim(),
+                filename: doc.filename || doc.name || '',
+                fileType: doc.fileType || doc.type || '',
+              };
+            }
+            return null;
+          })
+          .filter((d) => d && d.url);
+      },
     },
     images: {
       type: [String],
       default: [],
     },
-    video: {
-      type: String,
-      trim: true,
-      default: '',
-    },
     videoUrl: {
-      type: String,
-      trim: true,
-      default: '',
-    },
-    videos: {
-      type: [String],
-      default: [],
-    },
-    brochure: {
       type: String,
       trim: true,
       default: '',
@@ -237,24 +289,17 @@ const propertySchema = new mongoose.Schema(
       type: [String],
       default: [],
     },
-    documents: {
-      type: [String],
-      default: [],
-    },
 
     // ==========================================
-    // Dual-Compatibility Marketplace Fields
-    // (Ensures frontend cards, filters, and seed scripts remain 100% functional)
+    // Marketplace Root Fields
     // ==========================================
     title: { type: String, trim: true, default: '' },
     subtitle: { type: String, trim: true, default: '' },
     description: { type: String, trim: true, default: '' },
     category: { type: String, trim: true, default: 'properties', index: true },
-    subcategory: { type: String, trim: true, index: true },
     purpose: { type: String, enum: ['Sell', 'Rent', 'Lease'], default: 'Sell', index: true },
     price: { type: String, trim: true, default: '' },
     numericPrice: { type: Number, default: 0, index: true },
-    rawPrice: { type: Number, index: true },
     priceType: { type: String, default: 'fixed', trim: true },
     priceSuffix: { type: String, default: '', trim: true },
     negotiable: { type: Boolean, default: false },
@@ -265,10 +310,9 @@ const propertySchema = new mongoose.Schema(
     pincode: { type: String, trim: true, default: '' },
     address: { type: String, trim: true, default: '' },
     landmark: { type: String, trim: true, default: '' },
-    location: { type: String, trim: true, default: '' },
+    mapUrl: { type: String, trim: true, default: '' },
     contact: { type: String, trim: true, default: '' },
     contactEmail: { type: String, trim: true, default: '' },
-    email: { type: String, trim: true, default: '' },
     featured: { type: Boolean, default: false, index: true },
     verified: { type: Boolean, default: false },
     viewsCount: { type: Number, default: 0, index: true },
@@ -277,16 +321,17 @@ const propertySchema = new mongoose.Schema(
     availabilityUpdatedAt: { type: Date },
     availabilityUpdatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Admin" },
     possessionStatus: { type: String, trim: true, default: "" },
-    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
-    lister: { type: mongoose.Schema.Types.ObjectId, ref: 'Lister', index: true },
     listerId: { type: String, trim: true, index: true },
-    lister_id: { type: String, trim: true },
     contributor: { type: mongoose.Schema.Types.Mixed },
     agent: {
       name: { type: String, trim: true, default: '' },
       type: { type: String, default: 'Channel Partner' },
       avatar: { type: String, default: '' },
     },
+    isBulkListing: { type: Boolean, default: false, index: true },
+    bulkBatchId: { type: String, trim: true, index: true },
+    bulkFilename: { type: String, trim: true },
+    bulkUploadedAt: { type: Date },
   },
   {
     timestamps: true,
@@ -300,7 +345,7 @@ const propertySchema = new mongoose.Schema(
           ret.details.apartmentName ||
           ret.details.projectName ||
           ret.details.propertyName ||
-          `${ret.propertyType} Property`;
+          `${ret.propertyType || 'Residential'} Property`;
         ret.price = ret.price || ret.details.expectedPrice || ret.details.expectedPricePerAcre || '';
         ret.channelPartnerName = ret.channelPartnerName || ret.details.channelPartnerName || '';
         ret.bankLoanDetails = ret.bankLoanDetails || ret.details.bankLoanDetails || '';
@@ -314,20 +359,135 @@ const propertySchema = new mongoose.Schema(
             .filter((d) => d && d.fileType && d.fileType.startsWith('image'))
             .map((d) => d.url);
         }
-        ret.video = ret.video || ret.videoUrl || (Array.isArray(ret.videos) && ret.videos[0]) || '';
-        ret.brochure = ret.brochure || ret.pdfUrl || '';
+
+        // Ensure single canonical mapUrl at root
+        const locUrl = (
+          ret.mapUrl ||
+          ret.details?.mapUrl ||
+          ''
+        ).trim();
+        ret.mapUrl = locUrl;
+
+        // Remove all duplicate map URL keys
+        delete ret.googleMapsUrl;
+        delete ret.googleMapUrl;
+        delete ret.mapEmbedUrl;
+        delete ret.resolvedLocationUrl;
+        delete ret.locationUrl;
+
+        // Remove duplicate user/lister keys
+        delete ret.lister;
+        delete ret.user;
+        if (ret.contributor?.listerId && ret.listerId === ret.contributor.listerId) {
+          delete ret.listerId;
+        }
+
+        // Remove duplicate media aliases
+        delete ret.video;
+        delete ret.videos;
+        delete ret.brochure;
+        delete ret.email;
+        delete ret.rawPrice;
+        delete ret.isPriority;
+
+        // Clean details duplicates
+        if (ret.details && typeof ret.details === 'object') {
+          delete ret.details.mapUrl;
+          delete ret.details.googleMapsUrl;
+          delete ret.details.googleMapUrl;
+          delete ret.details.mapEmbedUrl;
+          delete ret.details.resolvedLocationUrl;
+          delete ret.details.locationUrl;
+
+          if (ret.details.propertyName === ret.title) delete ret.details.propertyName;
+          if (ret.details.expectedPrice === ret.price) delete ret.details.expectedPrice;
+          if (ret.details.possessionStatus === ret.possessionStatus) delete ret.details.possessionStatus;
+          if (ret.details.vendorName === ret.vendorName) delete ret.details.vendorName;
+          if (ret.details.channelPartnerName === ret.channelPartnerName) delete ret.details.channelPartnerName;
+          if (ret.details.approvalAuthority === ret.approval) delete ret.details.approvalAuthority;
+        }
+
+        if (ret.propertyType) {
+          ret.propertyType = normalizeCanonicalPropertyType(ret.propertyType);
+        }
+        delete ret.subcategory;
+
         return ret;
       },
     },
-    toObject: { virtuals: true },
+    toObject: { virtuals: false },
   }
 );
 
+// Virtual properties for direct document access
+propertySchema.virtual('lister', {
+  ref: 'Lister',
+  localField: 'createdBy',
+  foreignField: '_id',
+  justOne: true,
+});
+propertySchema.virtual('video').get(function () {
+  return this.videoUrl || '';
+});
+propertySchema.virtual('videos').get(function () {
+  return this.videoUrl ? [this.videoUrl] : [];
+});
+propertySchema.virtual('brochure').get(function () {
+  return this.pdfUrl || '';
+});
+propertySchema.virtual('email').get(function () {
+  return this.contactEmail || '';
+});
+propertySchema.virtual('location').get(function () {
+  return this.address || '';
+});
+propertySchema.virtual('subcategory')
+  .get(function () {
+    return this.propertyType;
+  })
+  .set(function (val) {
+    if (val) this.propertyType = normalizeCanonicalPropertyType(val);
+  });
+propertySchema.pre('save', function (next) {
+  const url = (
+    this.mapUrl ||
+    this.details?.mapUrl ||
+    ''
+  ).trim();
+
+  this.mapUrl = url;
+  this.locationUrl = undefined;
+  this.googleMapsUrl = undefined;
+  this.googleMapUrl = undefined;
+  this.mapEmbedUrl = undefined;
+  this.resolvedLocationUrl = undefined;
+
+  if (this.details) {
+    this.details.mapUrl = url;
+    this.details.locationUrl = undefined;
+    this.details.googleMapsUrl = undefined;
+    this.details.googleMapUrl = undefined;
+    this.details.mapEmbedUrl = undefined;
+    this.details.resolvedLocationUrl = undefined;
+  }
+  next();
+});
+propertySchema.virtual('rawPrice').get(function () {
+  return this.numericPrice || 0;
+});
+propertySchema.virtual('isPriority').get(function () {
+  return Boolean(this.priority && this.priority > 0);
+});
+propertySchema.virtual('user').get(function () {
+  return this.createdBy;
+});
+
 // Compound Indexes for fast dashboard & filter queries
+propertySchema.index({ status: 1, availabilityStatus: 1, priority: -1, createdAt: -1 });
+propertySchema.index({ status: 1, availabilityStatus: 1, numericPrice: 1 });
+propertySchema.index({ status: 1, city: 1, propertyType: 1, createdAt: -1 });
 propertySchema.index({ propertyType: 1, status: 1 });
 propertySchema.index({ createdBy: 1, createdAt: -1 });
-propertySchema.index({ user: 1, createdAt: -1 });
-propertySchema.index({ lister: 1, createdAt: -1 });
 propertySchema.index({ city: 1, area: 1 });
 propertySchema.index({ createdAt: -1 });
 
@@ -360,13 +520,20 @@ propertySchema.index(
 
 // Pre-save synchronization hook
 propertySchema.pre('save', function (next) {
-  // Sync createdBy <-> user for dual compatibility
-  if (!this.user && this.createdBy) {
-    this.user = this.createdBy;
-  }
-  if (!this.createdBy && this.user) {
-    this.createdBy = this.user;
-  }
+  // Consolidate duplicate incoming media fields
+  if (!this.videoUrl && this.video) this.videoUrl = this.video;
+  if (!this.videoUrl && Array.isArray(this.videos) && this.videos[0]) this.videoUrl = this.videos[0];
+  this.video = undefined;
+  this.videos = undefined;
+
+  if (!this.pdfUrl && this.brochure) this.pdfUrl = this.brochure;
+  this.brochure = undefined;
+
+  if (!this.contactEmail && this.email) this.contactEmail = this.email;
+  this.email = undefined;
+
+  if (!this.address && this.location) this.address = this.location;
+  this.location = undefined;
 
   // Derive title from details if empty
   const d = this.details || {};
@@ -395,7 +562,6 @@ propertySchema.pre('save', function (next) {
       } else {
         this.numericPrice = num;
       }
-      this.rawPrice = this.numericPrice;
     }
   }
 
@@ -411,18 +577,31 @@ propertySchema.pre('save', function (next) {
     this.landmark = d.landmark;
   }
 
-  // Sync possessionStatus
-  if (this.possessionStatus && this.details && typeof this.details === "object") {
-    this.details.possessionStatus = this.possessionStatus;
-  } else if (!this.possessionStatus && d.possessionStatus) {
-    this.possessionStatus = d.possessionStatus;
+  // Clean redundant root fields from details so they don't duplicate
+  if (this.details && typeof this.details === 'object') {
+    delete this.details.propertyName;
+    delete this.details.expectedPrice;
+    delete this.details.negotiable;
+    delete this.details.channelPartnerName;
+    delete this.details.vendorName;
+    delete this.details.description;
+    delete this.details.possessionStatus;
+    delete this.details.listerId;
   }
 
-  // Sync video and brochure aliases
-  if (this.video && !this.videoUrl) this.videoUrl = this.video;
-  if (this.videoUrl && !this.video) this.video = this.videoUrl;
-  if (this.brochure && !this.pdfUrl) this.pdfUrl = this.brochure;
-  if (this.pdfUrl && !this.brochure) this.brochure = this.pdfUrl;
+  if (this.lister && !this.createdBy) {
+    this.createdBy = this.lister;
+  }
+
+  if (this.propertyType) {
+    this.propertyType = normalizeCanonicalPropertyType(this.propertyType);
+  }
+  if (this.details && typeof this.details === 'object') {
+    this.details.propertyType = this.propertyType;
+  }
+  if (this._doc && 'subcategory' in this._doc) {
+    delete this._doc.subcategory;
+  }
 
   next();
 });
@@ -431,5 +610,7 @@ const Property = mongoose.models.Property || mongoose.model('Property', property
 
 module.exports = Property;
 module.exports.PROPERTY_TYPES = PROPERTY_TYPES;
+module.exports.CANONICAL_PROPERTY_TYPES = CANONICAL_PROPERTY_TYPES;
+module.exports.normalizeCanonicalPropertyType = normalizeCanonicalPropertyType;
 module.exports.PROPERTY_STATUSES = PROPERTY_STATUSES;
 

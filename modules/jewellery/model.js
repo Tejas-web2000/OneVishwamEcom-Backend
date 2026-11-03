@@ -29,21 +29,45 @@ const jewellerySchema = new mongoose.Schema({
   tryAtHome: { type: Boolean, default: false, index: true },
   aiRecommended: { type: Boolean, default: false, index: true },
   images: { type: [String], default: [] },
-  video: { type: String, default: '', trim: true },
   videoUrl: { type: String, default: '', trim: true },
-  videos: { type: [String], default: [] },
   documents: { type: [String], default: [] },
   pdfUrl: { type: String, default: '' },
   brochure: { type: String, default: '' },
   store: { type: storeSchema, default: null },
   description: { type: String, maxlength: 5000 },
   gemstone: { type: String, trim: true },
-  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
-  lister: { type: mongoose.Schema.Types.ObjectId, ref: 'Lister', index: true },
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Lister', index: true },
   availabilityStatus: { type: String, enum: ['available', 'sold_out', 'inactive'], default: 'available', index: true },
   status: { type: String, enum: ['active', 'inactive', 'sold', 'pending', 'approved', 'changes-required', 'cancelled'], default: 'active', index: true },
   featured: { type: Boolean, default: false, index: true },
-}, { timestamps: true, toJSON: { virtuals: true }, toObject: { virtuals: true } });
+  isBulkListing: { type: Boolean, default: false, index: true },
+  bulkBatchId: { type: String, trim: true, index: true },
+  bulkFilename: { type: String, trim: true },
+  bulkUploadedAt: { type: Date },
+}, {
+  timestamps: true,
+  toJSON: {
+    virtuals: true,
+    transform: (doc, ret) => {
+      delete ret.__v;
+      ret.lister = ret.lister || ret.createdBy;
+      ret.user = ret.createdBy;
+      return ret;
+    },
+  },
+  toObject: { virtuals: true },
+});
+
+jewellerySchema.virtual('lister', {
+  ref: 'Lister',
+  localField: 'createdBy',
+  foreignField: '_id',
+  justOne: true,
+});
+
+jewellerySchema.virtual('user').get(function () {
+  return this.createdBy;
+});
 
 jewellerySchema.index({ category: 1, status: 1 });
 jewellerySchema.index({ metalType: 1, purity: 1 });
@@ -56,6 +80,11 @@ jewellerySchema.index({
 }, { weights: { name: 10, title: 10, category: 5, metalType: 5, description: 1, 'store.city': 3 }, name: 'jewellery_search' });
 
 jewellerySchema.pre('save', function (next) {
+  if (!this.videoUrl && this.video) this.videoUrl = this.video;
+  if (!this.videoUrl && Array.isArray(this.videos) && this.videos[0]) this.videoUrl = this.videos[0];
+  this.video = undefined;
+  this.videos = undefined;
+
   if (this.isNew && !this.name && this.title) this.name = this.title;
   if (this.isNew && !this.title && this.name) this.title = this.name;
   if (this.isModified('price') || this.isNew) {
