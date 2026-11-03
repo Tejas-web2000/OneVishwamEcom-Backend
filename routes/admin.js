@@ -53,6 +53,9 @@ router.patch('/listings/:type/:id/approve', adminController.approveListing);
 router.patch('/listings/:type/:id/changes', adminController.requestChanges);
 router.patch('/listings/:type/:id/cancel', adminController.cancelListing);
 router.patch('/listings/:type/:id/availability', adminController.updateAvailabilityStatus);
+router.patch('/listings/:type/:id/images/reorder', adminController.reorderListingImages);
+router.patch('/listings/:id/images/reorder', adminController.reorderListingImages);
+router.patch('/products/:id/images/reorder', adminController.reorderListingImages);
 router.delete('/listings/:type/:id', adminController.deleteListing);
 
 // Contributors
@@ -62,5 +65,10 @@ router.get('/contributors/:id', adminController.getContributorById);
 // Website Users
 router.get('/users/stats', adminController.getWebsiteUserStats);
 router.get('/users', adminController.getWebsiteUsers);
+router.get('/users/:id/activity', adminController.getUserActivity);
+
+// Activity & Interest Tracking
+router.get('/activity/stats', adminController.getActivityStats);
+router.get('/activity/category-breakdown', adminController.getCategoryBreakdown);
 
 module.exports = router;

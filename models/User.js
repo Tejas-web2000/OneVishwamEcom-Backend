@@ -35,6 +35,7 @@ const userSchema = new mongoose.Schema(
       trim: true,
       unique: true,
       sparse: true,
+      index: true,
     },
     listerId: {
       type: String,
@@ -79,10 +80,34 @@ const userSchema = new mongoose.Schema(
       default: 'active',
     },
     lastLogin: { type: Date },
+    lastActiveAt: { type: Date },
+    totalTimeSpent: { type: Number, default: 0 },
+    sessionDuration: { type: Number, default: 0 },
+    loginCount: { type: Number, default: 0 },
     refreshToken: { type: String, select: false },
     resetPasswordToken: String,
     resetPasswordExpire: Date,
     savedListings: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Property' }],
+    interests: [
+      {
+        category: { type: String, required: true },
+        viewCount: { type: Number, default: 1 },
+        lastVisitedAt: { type: Date, default: Date.now },
+      },
+    ],
+    browsingHistory: [
+      {
+        category: { type: String, default: 'general' },
+        listingId: { type: String },
+        title: { type: String, default: '' },
+        price: { type: String, default: '' },
+        location: { type: String, default: '' },
+        image: { type: String, default: '' },
+        path: { type: String, default: '' },
+        visitedAt: { type: Date, default: Date.now },
+      },
+    ],
+    primaryInterest: { type: String, default: '' },
     notifications: {
       email: { type: Boolean, default: false },
       whatsapp: { type: Boolean, default: false },
@@ -162,6 +187,10 @@ userSchema.methods.toProfileJSON = function () {
     accountStatus: this.accountStatus || this.status,
     status: this.status || this.accountStatus,
     lastLogin: this.lastLogin,
+    lastActiveAt: this.lastActiveAt,
+    totalTimeSpent: this.totalTimeSpent || 0,
+    sessionDuration: this.sessionDuration || 0,
+    loginCount: this.loginCount || 0,
     createdAt: this.createdAt,
     notifications: {
       email: this.notifications?.email ?? false,

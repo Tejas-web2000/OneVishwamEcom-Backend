@@ -1,14 +1,56 @@
 const mongoose = require('mongoose');
 
-const PROPERTY_TYPES = [
+const CANONICAL_PROPERTY_TYPES = [
   'Residential',
-  'Flat/Villa',
+  'Flat',
   'Independent House',
+  'Plot',
+  'Land',
   'Agricultural',
   'Commercial',
-  'Plot/Land',
   'Industrial',
 ];
+
+const PROPERTY_TYPES = [
+  ...CANONICAL_PROPERTY_TYPES,
+  'Flat / Villa',
+  'Flat/Villa',
+  'Plot / Land',
+  'Plot/Land',
+  'Villa',
+];
+
+function normalizeCanonicalPropertyType(val) {
+  if (!val || typeof val !== 'string' || !val.trim()) return 'Plot';
+  const str = String(val).trim().toLowerCase();
+  if (
+    str === 'flat/villa' ||
+    str === 'flat / villa' ||
+    str === 'flat' ||
+    str.includes('flat') ||
+    str.includes('apartment') ||
+    str.includes('villa')
+  ) {
+    return 'Flat';
+  }
+  if (
+    str === 'plot/land' ||
+    str === 'plot / land' ||
+    str.includes('plot') ||
+    str.includes('layout') ||
+    str.includes('plat') ||
+    str.includes('site')
+  ) {
+    return 'Plot';
+  }
+  if (str.includes('land') && !str.includes('agri')) return 'Land';
+  if (str.includes('independent') || str.includes('house')) return 'Independent House';
+  if (str.includes('agri') || str.includes('farm') || str.includes('plantation')) return 'Agricultural';
+  if (str.includes('commercial') || str.includes('shop') || str.includes('office') || str.includes('retail') || str.includes('showroom')) return 'Commercial';
+  if (str.includes('indus') || str.includes('factory') || str.includes('warehouse') || str.includes('shed')) return 'Industrial';
+  if (str.includes('residen')) return 'Residential';
+  return 'Plot';
+}
 
 const PROPERTY_STATUSES = [
   'pending',
@@ -160,6 +202,7 @@ const propertySchema = new mongoose.Schema(
         values: PROPERTY_TYPES,
         message: '{VALUE} is not a supported propertyType',
       },
+      set: (v) => normalizeCanonicalPropertyType(v),
       index: true,
     },
     createdBy: {
@@ -209,6 +252,24 @@ const propertySchema = new mongoose.Schema(
     documents: {
       type: [documentItemSchema],
       default: [],
+      set: (docs) => {
+        if (!Array.isArray(docs)) return [];
+        return docs
+          .map((doc) => {
+            if (typeof doc === 'string') {
+              return { url: doc.trim(), filename: '', fileType: '' };
+            }
+            if (doc && typeof doc === 'object') {
+              return {
+                url: (doc.url || doc.path || doc.src || '').trim(),
+                filename: doc.filename || doc.name || '',
+                fileType: doc.fileType || doc.type || '',
+              };
+            }
+            return null;
+          })
+          .filter((d) => d && d.url);
+      },
     },
     images: {
       type: [String],
@@ -236,7 +297,6 @@ const propertySchema = new mongoose.Schema(
     subtitle: { type: String, trim: true, default: '' },
     description: { type: String, trim: true, default: '' },
     category: { type: String, trim: true, default: 'properties', index: true },
-    subcategory: { type: String, trim: true, index: true },
     purpose: { type: String, enum: ['Sell', 'Rent', 'Lease'], default: 'Sell', index: true },
     price: { type: String, trim: true, default: '' },
     numericPrice: { type: Number, default: 0, index: true },
@@ -250,6 +310,7 @@ const propertySchema = new mongoose.Schema(
     pincode: { type: String, trim: true, default: '' },
     address: { type: String, trim: true, default: '' },
     landmark: { type: String, trim: true, default: '' },
+    mapUrl: { type: String, trim: true, default: '' },
     contact: { type: String, trim: true, default: '' },
     contactEmail: { type: String, trim: true, default: '' },
     featured: { type: Boolean, default: false, index: true },
@@ -299,29 +360,62 @@ const propertySchema = new mongoose.Schema(
             .map((d) => d.url);
         }
 
-        // Virtual backwards-compatible aliases (ensures zero breaking changes across all frontends)
-        const v = ret.videoUrl || '';
-        ret.video = v;
-        ret.videos = v ? [v] : [];
-        ret.brochure = ret.pdfUrl || '';
-        ret.email = ret.contactEmail || '';
-        ret.location = ret.address || '';
-        ret.rawPrice = ret.numericPrice || 0;
-        ret.isPriority = Boolean(ret.priority && ret.priority > 0);
-        ret.lister = ret.lister || ret.createdBy;
-        ret.user = ret.createdBy;
+        // Ensure single canonical mapUrl at root
+        const locUrl = (
+          ret.mapUrl ||
+          ret.details?.mapUrl ||
+          ''
+        ).trim();
+        ret.mapUrl = locUrl;
 
-        // Virtual details compatibility
-        if (!ret.details.propertyName) ret.details.propertyName = ret.title;
-        if (!ret.details.expectedPrice) ret.details.expectedPrice = ret.price;
-        if (!ret.details.possessionStatus) ret.details.possessionStatus = ret.possessionStatus;
-        if (!ret.details.vendorName) ret.details.vendorName = ret.vendorName;
-        if (!ret.details.channelPartnerName) ret.details.channelPartnerName = ret.channelPartnerName;
+        // Remove all duplicate map URL keys
+        delete ret.googleMapsUrl;
+        delete ret.googleMapUrl;
+        delete ret.mapEmbedUrl;
+        delete ret.resolvedLocationUrl;
+        delete ret.locationUrl;
+
+        // Remove duplicate user/lister keys
+        delete ret.lister;
+        delete ret.user;
+        if (ret.contributor?.listerId && ret.listerId === ret.contributor.listerId) {
+          delete ret.listerId;
+        }
+
+        // Remove duplicate media aliases
+        delete ret.video;
+        delete ret.videos;
+        delete ret.brochure;
+        delete ret.email;
+        delete ret.rawPrice;
+        delete ret.isPriority;
+
+        // Clean details duplicates
+        if (ret.details && typeof ret.details === 'object') {
+          delete ret.details.mapUrl;
+          delete ret.details.googleMapsUrl;
+          delete ret.details.googleMapUrl;
+          delete ret.details.mapEmbedUrl;
+          delete ret.details.resolvedLocationUrl;
+          delete ret.details.locationUrl;
+
+          if (ret.details.propertyName === ret.title) delete ret.details.propertyName;
+          if (ret.details.expectedPrice === ret.price) delete ret.details.expectedPrice;
+          if (ret.details.possessionStatus === ret.possessionStatus) delete ret.details.possessionStatus;
+          if (ret.details.vendorName === ret.vendorName) delete ret.details.vendorName;
+          if (ret.details.channelPartnerName === ret.channelPartnerName) delete ret.details.channelPartnerName;
+          if (ret.details.approvalAuthority === ret.approval) delete ret.details.approvalAuthority;
+        }
+
+        if (ret.propertyType) {
+          ret.propertyType = normalizeCanonicalPropertyType(ret.propertyType);
+        }
+        delete ret.subcategory;
 
         return ret;
       },
     },
-    toObject: { virtuals: true },
+    toObject: { virtuals: false },
   }
 );
 
@@ -347,6 +441,37 @@ propertySchema.virtual('email').get(function () {
 propertySchema.virtual('location').get(function () {
   return this.address || '';
 });
+propertySchema.virtual('subcategory')
+  .get(function () {
+    return this.propertyType;
+  })
+  .set(function (val) {
+    if (val) this.propertyType = normalizeCanonicalPropertyType(val);
+  });
+propertySchema.pre('save', function (next) {
+  const url = (
+    this.mapUrl ||
+    this.details?.mapUrl ||
+    ''
+  ).trim();
+
+  this.mapUrl = url;
+  this.locationUrl = undefined;
+  this.googleMapsUrl = undefined;
+  this.googleMapUrl = undefined;
+  this.mapEmbedUrl = undefined;
+  this.resolvedLocationUrl = undefined;
+
+  if (this.details) {
+    this.details.mapUrl = url;
+    this.details.locationUrl = undefined;
+    this.details.googleMapsUrl = undefined;
+    this.details.googleMapUrl = undefined;
+    this.details.mapEmbedUrl = undefined;
+    this.details.resolvedLocationUrl = undefined;
+  }
+  next();
+});
 propertySchema.virtual('rawPrice').get(function () {
   return this.numericPrice || 0;
 });
@@ -358,6 +483,9 @@ propertySchema.virtual('user').get(function () {
 });
 
 // Compound Indexes for fast dashboard & filter queries
+propertySchema.index({ status: 1, availabilityStatus: 1, priority: -1, createdAt: -1 });
+propertySchema.index({ status: 1, availabilityStatus: 1, numericPrice: 1 });
+propertySchema.index({ status: 1, city: 1, propertyType: 1, createdAt: -1 });
 propertySchema.index({ propertyType: 1, status: 1 });
 propertySchema.index({ createdBy: 1, createdAt: -1 });
 propertySchema.index({ city: 1, area: 1 });
@@ -465,6 +593,16 @@ propertySchema.pre('save', function (next) {
     this.createdBy = this.lister;
   }
 
+  if (this.propertyType) {
+    this.propertyType = normalizeCanonicalPropertyType(this.propertyType);
+  }
+  if (this.details && typeof this.details === 'object') {
+    this.details.propertyType = this.propertyType;
+  }
+  if (this._doc && 'subcategory' in this._doc) {
+    delete this._doc.subcategory;
+  }
+
   next();
 });
 
@@ -472,5 +610,7 @@ const Property = mongoose.models.Property || mongoose.model('Property', property
 
 module.exports = Property;
 module.exports.PROPERTY_TYPES = PROPERTY_TYPES;
+module.exports.CANONICAL_PROPERTY_TYPES = CANONICAL_PROPERTY_TYPES;
+module.exports.normalizeCanonicalPropertyType = normalizeCanonicalPropertyType;
 module.exports.PROPERTY_STATUSES = PROPERTY_STATUSES;
 

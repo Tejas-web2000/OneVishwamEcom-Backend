@@ -2,6 +2,8 @@ const Property = require('../models/Property');
 const ApiResponse = require('../utils/ApiResponse');
 const ApiError = require('../utils/ApiError');
 const asyncHandler = require('../utils/asyncHandler');
+const { resolveGoogleMapsUrl } = require('../utils/googleMapsResolver');
+const { recordProductAddition } = require('../services/announcementService');
 
 /**
  * Property Intake Controller
@@ -78,6 +80,27 @@ const createProperty = asyncHandler(async (req, res) => {
   if (!data.price) {
     data.price = d.expectedPrice || d.expectedPricePerAcre || '';
   }
+  const incomingMapUrl = (
+    data.mapUrl ||
+    d.mapUrl ||
+    ''
+  ).trim();
+
+  data.mapUrl = incomingMapUrl;
+  if (d) d.mapUrl = incomingMapUrl;
+
+  delete data.locationUrl;
+  delete data.googleMapsUrl;
+  delete data.googleMapUrl;
+  delete data.mapEmbedUrl;
+  delete data.resolvedLocationUrl;
+  if (d) {
+    delete d.locationUrl;
+    delete d.googleMapsUrl;
+    delete d.googleMapUrl;
+    delete d.mapEmbedUrl;
+    delete d.resolvedLocationUrl;
+  }
 
   const property = await Property.create(data);
   const populated = await Property.findById(property._id).populate(
@@ -107,7 +130,7 @@ const getProperties = asyncHandler(async (req, res) => {
   if (status) {
     filter.status = status;
   } else if (!req.auth || (req.auth.role !== 'admin' && req.auth.role !== 'super-admin')) {
-    filter.status = { $in: ['approved', 'active'] };
+    filter.status = { $in: ['approved', 'active', 'available'] };
   } else {
     filter.status = { $ne: 'deleted' };
   }
@@ -158,13 +181,127 @@ const getProperties = asyncHandler(async (req, res) => {
     Property.countDocuments(filter),
   ]);
 
+  const resolvePropertyLocality = (p) => {
+    if (!p) return '';
+    let locality = (p.locality || p.details?.locality || '').trim();
+    if (locality && !/^bangalore$/i.test(locality) && !/^bengaluru$/i.test(locality)) {
+      return locality;
+    }
+    const combined = `${p.title || ''} ${p.subtitle || ''} ${p.vendorName || ''} ${p.address || ''}`.toLowerCase();
+    if (combined.includes('nelamangala') || combined.includes('bmrda')) return 'Nelamangala';
+    if (combined.includes('kempegowda layout') || combined.includes('nada prabhu') || combined.includes('bda')) return 'Nada Prabhu Kempegowda Layout';
+    if (combined.includes('kanakapura') || combined.includes('annanta') || combined.includes('avaana') || combined.includes('oraiyan')) return 'Kanakapura Road';
+    if (combined.includes('begur') || combined.includes('bbmp enclave') || combined.includes('sp prime')) return 'Begur';
+    if (combined.includes('electronic city') || combined.includes('e-city') || combined.includes('showroom')) return 'Electronic City';
+    if (combined.includes('sarjapur')) return 'Sarjapur Road';
+    if (combined.includes('whitefield') || combined.includes('fortuna')) return 'Whitefield';
+    if (combined.includes('devanahalli') || combined.includes('artemis')) return 'Devanahalli';
+    if (combined.includes('yelahanka')) return 'Yelahanka';
+    if (combined.includes('thanisandra')) return 'Thanisandra';
+    if (combined.includes('kengeri') || combined.includes('sampada')) return 'Kengeri';
+    if (combined.includes('bidadi') || combined.includes('bhoo vaibhav')) return 'Bidadi';
+    if (combined.includes('dobbaspet') || combined.includes('dhabaspet')) return 'Dobbaspet';
+    if (combined.includes('gottigere') || combined.includes('vedanth')) return 'Gottigere';
+    if (combined.includes('jigani')) return 'Jigani';
+    return locality;
+  };
+
+  const formatResolvedLocation = (p) => {
+    const address = (p.address || '').trim();
+    const locality = resolvePropertyLocality(p);
+    const rawCity = (p.city || p.details?.city || 'Bangalore').trim();
+    const city = /^\d+$/.test(rawCity) ? 'Bangalore' : (/^bengaluru$/i.test(rawCity) ? 'Bangalore' : rawCity);
+    const cleanAddr = address.toLowerCase();
+    const isAddressJustCity = !address || cleanAddr === 'bangalore' || cleanAddr === 'bengaluru' || cleanAddr === city.toLowerCase();
+
+    let resolvedLocation = address;
+    if (!resolvedLocation || isAddressJustCity) {
+      resolvedLocation = [locality, city].filter(Boolean).join(', ');
+    } else if (locality && !resolvedLocation.toLowerCase().includes(locality.toLowerCase())) {
+      resolvedLocation = `${locality}, ${resolvedLocation}`;
+    }
+    return resolvedLocation || locality || city || 'Bangalore';
+  };
+
+  const cleanPropertyOutput = (p) => {
+    if (!p || typeof p !== 'object') return p;
+    const cleanP = { ...p };
+
+    // Remove legacy map duplicate keys
+    delete cleanP.locationUrl;
+    delete cleanP.googleMapsUrl;
+    delete cleanP.googleMapUrl;
+    delete cleanP.mapEmbedUrl;
+    delete cleanP.resolvedLocationUrl;
+
+    // Remove redundant user/lister aliases
+    delete cleanP.user;
+    delete cleanP.lister;
+    if (cleanP.contributor?.listerId && cleanP.listerId === cleanP.contributor.listerId) {
+      delete cleanP.listerId;
+    }
+
+    // Remove redundant media/virtual aliases
+    delete cleanP.video;
+    delete cleanP.videos;
+    delete cleanP.brochure;
+    delete cleanP.email;
+    delete cleanP.rawPrice;
+    delete cleanP.isPriority;
+
+    // Clean details subdocument duplicates
+    if (cleanP.details && typeof cleanP.details === 'object') {
+      cleanP.details = { ...cleanP.details };
+      delete cleanP.details.mapUrl;
+      delete cleanP.details.locationUrl;
+      delete cleanP.details.googleMapsUrl;
+      delete cleanP.details.googleMapUrl;
+      delete cleanP.details.mapEmbedUrl;
+      delete cleanP.details.resolvedLocationUrl;
+
+      if (cleanP.details.propertyName === cleanP.title) delete cleanP.details.propertyName;
+      if (cleanP.details.expectedPrice === cleanP.price) delete cleanP.details.expectedPrice;
+      if (cleanP.details.possessionStatus === cleanP.possessionStatus) delete cleanP.details.possessionStatus;
+      if (cleanP.details.vendorName === cleanP.vendorName) delete cleanP.details.vendorName;
+      if (cleanP.details.channelPartnerName === cleanP.channelPartnerName) delete cleanP.details.channelPartnerName;
+      if (cleanP.details.approvalAuthority === cleanP.approval) delete cleanP.details.approvalAuthority;
+    }
+
+    // Remove subtitle if identical to vendorName or channelPartnerName
+    if (cleanP.subtitle && (cleanP.subtitle === cleanP.vendorName || cleanP.subtitle === cleanP.channelPartnerName)) {
+      delete cleanP.subtitle;
+    }
+
+    return cleanP;
+  };
+
+  const formattedProperties = properties.map((p) => {
+    const loc = formatResolvedLocation(p);
+    const resolvedLocality = resolvePropertyLocality(p);
+    const locUrl = (
+      p.mapUrl ||
+      p.details?.mapUrl ||
+      ''
+    ).trim();
+
+    const cleaned = cleanPropertyOutput(p);
+
+    return {
+      ...cleaned,
+      location: loc,
+      locality: resolvedLocality || p.locality,
+      address: p.address || loc,
+      mapUrl: locUrl,
+    };
+  });
+
   const totalPages = Math.ceil(total / limit) || 1;
 
-  new ApiResponse(
+  const response = new ApiResponse(
     200,
     {
-      properties,
-      items: properties,
+      properties: formattedProperties,
+      items: formattedProperties,
       total,
       totalPages,
       page,
@@ -173,7 +310,13 @@ const getProperties = asyncHandler(async (req, res) => {
       hasPrevPage: page > 1,
     },
     'Properties fetched successfully'
-  ).send(res);
+  );
+
+  if (!req.headers.authorization) {
+    response.setCache(60, 120, 300);
+  }
+
+  response.send(res);
 });
 
 // @desc    Get single property by ID
@@ -181,14 +324,35 @@ const getProperties = asyncHandler(async (req, res) => {
 // @access  Public
 const getPropertyById = asyncHandler(async (req, res) => {
   const property = await Property.findById(req.params.id)
-    .populate('createdBy', 'name fullName email phoneNumber profileImage avatar')
-    .populate('user', 'name fullName email phoneNumber profileImage avatar');
+    .populate('createdBy', 'name fullName email phoneNumber profileImage avatar');
 
   if (!property || property.status === 'deleted') {
     throw new ApiError(404, 'Property listing not found');
   }
 
-  new ApiResponse(200, { property, item: property }, 'Property fetched successfully').send(res);
+  const pObj = property.toObject ? property.toObject({ virtuals: false }) : property;
+  const loc = formatResolvedLocation(pObj);
+  const resolvedLocality = resolvePropertyLocality(pObj);
+
+  pObj.location = loc;
+  pObj.locality = resolvedLocality || pObj.locality;
+  if (!pObj.address || pObj.address.toLowerCase() === 'bangalore' || pObj.address.toLowerCase() === 'bengaluru') {
+    pObj.address = loc;
+  }
+  const locUrl = (
+    pObj.mapUrl ||
+    pObj.details?.mapUrl ||
+    ''
+  ).trim();
+
+  pObj.mapUrl = locUrl;
+  const cleaned = cleanPropertyOutput(pObj);
+
+  const response = new ApiResponse(200, { property: cleaned, item: cleaned }, 'Property fetched successfully');
+  if (!req.headers.authorization) {
+    response.setCache(60, 120, 300);
+  }
+  response.send(res);
 });
 
 // @desc    Update property listing status (Admin only)
@@ -213,6 +377,12 @@ const updatePropertyStatus = asyncHandler(async (req, res) => {
   property.status = status;
   await property.save();
 
+  if (status === 'approved') {
+    recordProductAddition('properties', 1).catch((err) =>
+      console.error('Failed to log property announcement:', err.message)
+    );
+  }
+
   new ApiResponse(
     200,
     { property },
@@ -220,10 +390,24 @@ const updatePropertyStatus = asyncHandler(async (req, res) => {
   ).send(res);
 });
 
+// @desc    Resolve Google Maps URL to direct embed URL
+// @route   GET /api/properties/resolve-map-url
+// @access  Public
+const resolveMapUrlController = asyncHandler(async (req, res) => {
+  const targetUrl = req.query.url;
+  if (!targetUrl || typeof targetUrl !== 'string') {
+    throw new ApiError(400, 'url query parameter is required');
+  }
+
+  const result = await resolveGoogleMapsUrl(targetUrl);
+  new ApiResponse(200, result, 'Google Maps URL resolved successfully').send(res);
+});
+
 module.exports = {
   createProperty,
   getProperties,
   getPropertyById,
   updatePropertyStatus,
+  resolveMapUrlController,
 };
 

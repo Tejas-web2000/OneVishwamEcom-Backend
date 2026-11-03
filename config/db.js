@@ -40,11 +40,13 @@ const connectDB = async () => {
     return cachedPromise;
   }
 
-  // Active production cluster fallback (ensures backward compatibility if secrets are omitted)
-  const activeClusterUri =
-    "mongodb+srv://onevishwamecom_db_user:VishwamPass123@onevishwam.372aojy.mongodb.net/onevishwam?retryWrites=true&w=majority";
+  const mongoUri = process.env.ATLAS_MONGODB_URI || process.env.MONGODB_URI;
 
-  const mongoUri = process.env.ATLAS_MONGODB_URI || process.env.MONGODB_URI || activeClusterUri;
+  if (!mongoUri) {
+    const errorMsg = "FATAL: MongoDB connection URI is missing. Please define ATLAS_MONGODB_URI or MONGODB_URI in your environment or secrets.";
+    console.error(`❌ [DATABASE] ${errorMsg}`);
+    throw new Error(errorMsg);
+  }
 
   const opts = {
     serverSelectionTimeoutMS: 8000,
@@ -65,6 +67,15 @@ const connectDB = async () => {
         await bootstrapAdmin().catch((err) =>
           console.warn("[ADMIN] Non-fatal bootstrap check error:", err.message)
         );
+        try {
+          const usersCol = conn.connection.collection('users');
+          const indexes = await usersCol.indexes();
+          const badIdx = indexes.find((i) => i.name === 'mobile_1' && !i.sparse);
+          if (badIdx) {
+            await usersCol.dropIndex('mobile_1').catch(() => null);
+            console.log('[DATABASE] Cleaned up legacy non-sparse mobile_1 index.');
+          }
+        } catch {}
         isBootstrapped = true;
       }
       return cachedConnection;

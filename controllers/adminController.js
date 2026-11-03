@@ -9,6 +9,8 @@ const modules = require('../modules');
 const Lister = require('../models/Lister');
 const { parsePrice } = require('../utils/priceUtils');
 const { deleteMultipleMediaFromStorage } = require('../utils/firebaseStorage');
+const { normalizeCanonicalPropertyType } = require('../models/Property');
+const { recordProductAddition } = require('../services/announcementService');
 
 // ─── Auth ───────────────────────────────────────────────────────────────────
 
@@ -111,19 +113,11 @@ const refresh = asyncHandler(async (req, res) => {
 
 // ─── Listing Management ─────────────────────────────────────────────────────
 
-const CATEGORY_TO_MODULE = {
-  properties: 'properties',
-  'real-estate': 'properties',
-  vehicle: 'vehicles',
-  grocery: 'groceries',
-  garment: 'garments',
-  jewellery: 'jewellery',
-  finance: 'finance',
-  service: 'properties',
-};
+const { CATEGORY_TO_MODULE, findModule: lookupModule, normalizeCategory } = require('../config/constants');
 
 function findModule(type) {
-  const mod = modules.find((m) => m.id === type);
+  if (!type) throw new ApiError(400, 'Listing type is required');
+  const mod = lookupModule(type, false);
   if (!mod) throw new ApiError(400, `Unknown listing type "${type}"`);
   return mod;
 }
@@ -137,7 +131,10 @@ const getPendingListings = asyncHandler(async (req, res) => {
   let total = 0;
 
   await Promise.all(modules.map(async (mod) => {
-    if (category && CATEGORY_TO_MODULE[category] && CATEGORY_TO_MODULE[category] !== mod.id) return;
+    if (category && category !== 'all') {
+      const targetMod = normalizeCategory(category);
+      if (targetMod !== mod.id) return;
+    }
     try {
       const items = await mod.model
         .find({ status: 'pending' })
@@ -166,7 +163,10 @@ const getAllListings = asyncHandler(async (req, res) => {
   let total = 0;
 
   await Promise.all(modules.map(async (mod) => {
-    if (category && CATEGORY_TO_MODULE[category] && CATEGORY_TO_MODULE[category] !== mod.id) return;
+    if (category && category !== 'all') {
+      const targetMod = normalizeCategory(category);
+      if (targetMod !== mod.id) return;
+    }
     const filter = {};
     if (status) filter.status = status;
     if (listerId) {
@@ -286,6 +286,38 @@ const getListingStats = asyncHandler(async (req, res) => {
     console.warn('⚠️ [ADMIN STATS]: User collection count failed:', err.message);
   }
 
+  // Exact aliases expected by Admin frontend
+  stats.totalListings = stats.total;
+  stats.pendingListings = stats.pending;
+  stats.approvedListings = stats.approved;
+  stats.cancelledListings = stats.cancelled;
+  stats.changesRequiredListings = stats['changes-required'];
+
+  try {
+    const VisitorCounter = require('../models/VisitorCounter');
+    const VisitorSession = require('../models/VisitorSession');
+    const d = new Date();
+    const today = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+    const counter = await VisitorCounter.findOne({ key: 'global' }).lean();
+    const activeThreshold = new Date(Date.now() - 45 * 1000);
+    const realActive = await VisitorSession.countDocuments({
+      isOnline: true,
+      lastSeenAt: { $gte: activeThreshold },
+    }).catch(() => 0);
+
+    const visitsToday = counter?.todayDate === today ? (counter?.todayHits || counter?.todayVisitors || 0) : 0;
+
+    stats.visitorStats = {
+      totalVisitors: counter?.totalVisitors || counter?.totalHits || 0,
+      totalHits: counter?.totalHits || counter?.totalVisitors || 0,
+      visitsToday: visitsToday || 0,
+      uniqueToday: counter?.todayVisitors || 0,
+      activeVisitors: Math.max(realActive, 1),
+    };
+  } catch (err) {
+    console.warn('⚠️ [ADMIN STATS]: Visitor counter fetch failed:', err.message);
+  }
+
   new ApiResponse(200, stats, 'Admin listing stats fetched').send(res);
 });
 
@@ -293,12 +325,19 @@ const getListingStats = asyncHandler(async (req, res) => {
 
 const getWebsiteUserStats = asyncHandler(async (req, res) => {
   const userRoleFilter = { role: { $ne: 'admin' } };
-  const [totalUsers, loggedInUsers, activeUsers, emailVerifiedUsers] = await Promise.all([
+  const [totalUsers, loggedInUsers, activeUsers, emailVerifiedUsers, durationAgg] = await Promise.all([
     User.countDocuments(userRoleFilter),
     User.countDocuments({ ...userRoleFilter, lastLogin: { $exists: true, $ne: null } }),
     User.countDocuments({ ...userRoleFilter, $or: [{ status: 'active' }, { accountStatus: 'active' }] }),
     User.countDocuments({ ...userRoleFilter, isEmailVerified: true }),
+    User.aggregate([
+      { $match: userRoleFilter },
+      { $group: { _id: null, totalSeconds: { $sum: '$totalTimeSpent' }, avgSeconds: { $avg: '$totalTimeSpent' } } },
+    ]).catch(() => []),
   ]);
+
+  const totalTimeSpentSeconds = durationAgg[0]?.totalSeconds || 0;
+  const avgTimeSpentSeconds = Math.round(durationAgg[0]?.avgSeconds || 0);
 
   new ApiResponse(
     200,
@@ -307,6 +346,8 @@ const getWebsiteUserStats = asyncHandler(async (req, res) => {
       loggedInUsers,
       activeUsers,
       emailVerifiedUsers,
+      totalTimeSpentSeconds,
+      avgTimeSpentSeconds,
     },
     'Website user stats fetched successfully'
   ).send(res);
@@ -369,11 +410,58 @@ const getWebsiteUsers = asyncHandler(async (req, res) => {
       isEmailVerified: Boolean(u.isEmailVerified),
       status: u.status || u.accountStatus || 'active',
       lastLogin: u.lastLogin || null,
+      lastActiveAt: u.lastActiveAt || u.updatedAt || u.lastLogin || null,
+      totalTimeSpent: u.totalTimeSpent || 0,
+      sessionDuration: u.sessionDuration || 0,
+      loginCount: u.loginCount || (u.lastLogin ? 1 : 0),
+      interests: u.interests || [],
+      primaryInterest: u.primaryInterest || '',
+      browsingHistory: (u.browsingHistory || []).slice(0, 10),
       createdAt: u.createdAt,
     };
   });
 
   new ApiResponse(200, { users: formattedUsers, total, page: p, limit: l }, 'Website users fetched').send(res);
+});
+
+const getUserActivity = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  let user = null;
+  if (mongoose.Types.ObjectId.isValid(id)) {
+    user = await User.findById(id).select('-password -refreshToken').lean();
+  }
+  if (!user) {
+    user = await User.findOne({ $or: [{ email: id }, { firebaseUid: id }] }).select('-password -refreshToken').lean();
+  }
+  if (!user) throw new ApiError(404, 'User not found');
+
+  new ApiResponse(
+    200,
+    {
+      user: {
+        _id: user._id,
+        name: user.name || user.fullName || 'User',
+        email: user.email || 'N/A',
+        phone: user.phoneNumber || user.mobile || 'N/A',
+        avatar: user.avatar || user.profileImage || '',
+        city: user.city || '',
+        area: user.area || '',
+        pincode: user.pincode || '',
+        role: user.role || 'user',
+        status: user.status || user.accountStatus || 'active',
+        isEmailVerified: Boolean(user.isEmailVerified),
+        lastLogin: user.lastLogin,
+        lastActiveAt: user.lastActiveAt,
+        totalTimeSpent: user.totalTimeSpent || 0,
+        sessionDuration: user.sessionDuration || 0,
+        createdAt: user.createdAt,
+        primaryInterest: user.primaryInterest || '',
+        interests: user.interests || [],
+        browsingHistory: user.browsingHistory || [],
+      },
+    },
+    'User activity fetched'
+  ).send(res);
 });
 
 const getListingDetail = asyncHandler(async (req, res) => {
@@ -460,11 +548,142 @@ const overrideListing = asyncHandler(async (req, res) => {
     }
   }
 
+  if (mod.id === 'properties') {
+    const rawType = updates.propertyType || updates.subcategory || item.propertyType || item.subcategory;
+    if (rawType) {
+      const canonicalType = normalizeCanonicalPropertyType(rawType);
+      updates.propertyType = canonicalType;
+      item.propertyType = canonicalType;
+      if (item.details && typeof item.details === 'object') {
+        item.details.propertyType = canonicalType;
+      }
+      if (updates.details && typeof updates.details === 'object') {
+        updates.details.propertyType = canonicalType;
+      }
+    }
+    delete updates.subcategory;
+    if (item.subcategory !== undefined) {
+      item.set('subcategory', undefined);
+    }
+    if (item._doc && 'subcategory' in item._doc) {
+      delete item._doc.subcategory;
+    }
+    item.markModified('propertyType');
+    item.markModified('details');
+  }
+
+  if (Array.isArray(updates.images)) {
+    const cleanImages = updates.images
+      .map((entry) => (typeof entry === 'string' ? entry.trim() : (entry?.url || entry?.src || '')))
+      .filter(Boolean)
+      .slice(0, 5);
+    item.images = cleanImages;
+    item.markModified('images');
+    if (item.details && typeof item.details === 'object') {
+      item.details.images = cleanImages;
+      item.markModified('details');
+    }
+  }
+
+  // Any edit in admin must NOT become pending status. Keep or set to 'approved'.
+  if (updates.status === 'pending' || !updates.status) {
+    if (item.status === 'pending' || item.status === 'changes-required' || item.status === 'approved' || !item.status) {
+      item.status = 'approved';
+      updates.status = 'approved';
+    } else {
+      updates.status = item.status;
+    }
+  } else {
+    item.status = updates.status;
+  }
+  item.adminComment = null;
+  item.markModified('status');
+
   Object.assign(item, updates);
+  if (Array.isArray(updates.images)) {
+    item.markModified('images');
+  }
   item.updatedAt = new Date();
   await item.save();
 
+  if (mod?.service?.cache) {
+    mod.service.cache.delete(String(id));
+  }
+
   new ApiResponse(200, { item }, 'Listing overridden successfully').send(res);
+});
+
+const reorderListingImages = asyncHandler(async (req, res) => {
+  const { type, id } = req.params;
+  const rawList = Array.isArray(req.body)
+    ? req.body
+    : Array.isArray(req.body.images)
+    ? req.body.images
+    : Array.isArray(req.body.reorderedImages)
+    ? req.body.reorderedImages
+    : null;
+
+  if (!rawList) {
+    throw new ApiError(400, 'Payload must be an array of images or an object containing an "images" array');
+  }
+
+  // Find target model
+  let targetMod = null;
+  let item = null;
+  if (type) {
+    targetMod = findModule(type);
+    item = await targetMod.model.findById(id);
+  } else {
+    for (const m of modules) {
+      if (!m?.model) continue;
+      const found = await m.model.findById(id);
+      if (found) {
+        targetMod = m;
+        item = found;
+        break;
+      }
+    }
+  }
+
+  if (!item) throw new ApiError(404, 'Listing not found');
+
+  // Parse and sort images based on position / index
+  let orderedUrls = [];
+  if (rawList.length > 0 && typeof rawList[0] === 'object' && rawList[0] !== null) {
+    // If elements have position or sort_order or order
+    const sorted = [...rawList].sort((a, b) => {
+      const posA = Number(a.position ?? a.order ?? a.sort_order ?? 0);
+      const posB = Number(b.position ?? b.order ?? b.sort_order ?? 0);
+      return posA - posB;
+    });
+    orderedUrls = sorted
+      .map((entry) => entry.url || entry.imageUrl || entry.image || entry.src || entry.imageId)
+      .filter((url) => typeof url === 'string' && url.trim().length > 0);
+  } else {
+    // Array of string URLs
+    orderedUrls = rawList
+      .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
+      .filter(Boolean);
+  }
+
+  // Enforce maximum 5 images
+  orderedUrls = orderedUrls.slice(0, 5);
+
+  item.images = orderedUrls;
+  if (item.details && typeof item.details === 'object' && Array.isArray(item.details.images)) {
+    item.details.images = orderedUrls;
+    item.markModified('details');
+  }
+  item.markModified('images');
+  item.updatedAt = new Date();
+  await item.save();
+
+  // Clear LRU cache if service exists
+  if (targetMod?.service?.cache) {
+    targetMod.service.cache.delete(String(id));
+  }
+
+  new ApiResponse(200, { item, images: item.images }, 'Images reordered successfully').send(res);
 });
 
 const updateListingStatus = asyncHandler(async (req, res) => {
@@ -519,6 +738,10 @@ const approveListing = asyncHandler(async (req, res) => {
 
   item.updatedAt = new Date();
   await item.save();
+
+  recordProductAddition(type || 'properties', 1).catch((err) =>
+    console.error('Failed to log product announcement in approveListing:', err.message)
+  );
 
   new ApiResponse(200, { item }, 'Listing approved successfully').send(res);
 });
@@ -820,6 +1043,89 @@ const getContributorById = asyncHandler(async (req, res) => {
   new ApiResponse(200, { contributor: lister, listings, totalListings }, 'Contributor details fetched').send(res);
 });
 
+const getCategoryBreakdown = asyncHandler(async (req, res) => {
+  const { timeframe = 'all' } = req.query;
+  const now = new Date();
+  const lookupTimeframe = {};
+
+  if (timeframe === 'day') {
+    lookupTimeframe.visitedAt = { $gte: new Date(now.setHours(0, 0, 0, 0)) };
+  } else if (timeframe === 'week') {
+    const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    lookupTimeframe.visitedAt = { $gte: weekAgo };
+  } else if (timeframe === 'month') {
+    const monthAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    lookupTimeframe.visitedAt = { $gte: monthAgo };
+  }
+  // 'all' returns no time filter
+
+  const pipeline = [
+    { $match: lookupTimeframe },
+    {
+      $group: {
+        _id: '$category',
+        totalVisits: { $sum: 1 },
+        uniqueVisitors: { $addToSet: '$sessionIdentifier' },
+        firstVisit: { $min: '$visitedAt' },
+        lastVisit: { $max: '$visitedAt' },
+      },
+    },
+    { $sort: { totalVisits: -1 } },
+  ];
+
+  const categoryBreakdown = await Activity.aggregate(pipeline);
+
+  // Format the unique visitor count
+  const formatted = categoryBreakdown.map((item) => ({
+    category: item._id || 'unknown',
+    totalVisits: item.totalVisits || 0,
+    uniqueVisitors: item.uniqueVisitors ? item.uniqueVisitors.length : 0,
+    firstVisit: item.firstVisit || null,
+    lastVisit: item.lastVisit || null,
+  }));
+
+  new ApiResponse(200, { categoryBreakdown: formatted, timeframe }).send(res);
+});
+
+const getActivityStats = asyncHandler(async (req, res) => {
+  const { timeframe = 'all' } = req.query;
+  const now = new Date();
+  const lookup = {};
+
+  if (timeframe === 'day') {
+    lookup.visitedAt = { $gte: new Date(now.setHours(0, 0, 0, 0)) };
+  } else if (timeframe === 'week') {
+    const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    lookup.visitedAt = { $gte: weekAgo };
+  } else if (timeframe === 'month') {
+    const monthAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    lookup.visitedAt = { $gte: monthAgo };
+  }
+
+  const totalActivity = await Activity.countDocuments(lookup);
+
+  const categoryStats = await Activity.aggregate([
+    { $match: lookup },
+    {
+      $group: {
+        _id: '$category',
+        count: { $sum: 1 },
+      },
+    },
+    { $sort: { count: -1 } },
+  ]);
+
+  new ApiResponse(
+    200,
+    {
+      totalActivity,
+      categoryStats,
+      timeframe,
+    },
+    'Activity stats fetched'
+  ).send(res);
+});
+
 module.exports = {
   login,
   getMe,
@@ -831,6 +1137,7 @@ module.exports = {
   getListingDetail,
   updateListingStatus,
   overrideListing,
+  reorderListingImages,
   approveListing,
   requestChanges,
   cancelListing,
@@ -840,4 +1147,7 @@ module.exports = {
   getContributorById,
   getWebsiteUserStats,
   getWebsiteUsers,
+  getUserActivity,
+  getActivityStats,
+  getCategoryBreakdown,
 };
