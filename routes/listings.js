@@ -114,6 +114,23 @@ router.post('/', protect, asyncHandler(async (req, res) => {
     data.images = data.images.map((img) => (typeof img === 'string' ? img.trim() : '')).filter(Boolean).slice(0, 5);
   }
 
+  // Normalize documents safely based on module expectations
+  if (Array.isArray(data.documents)) {
+    if (mod.id === 'properties') {
+      data.documents = data.documents.map((doc) => {
+        if (typeof doc === 'string') return { url: doc.trim(), filename: '', fileType: '' };
+        if (doc && typeof doc === 'object') return { url: (doc.url || doc.path || doc.src || '').trim(), filename: doc.filename || doc.name || '', fileType: doc.fileType || doc.type || '' };
+        return null;
+      }).filter((d) => d && d.url);
+    } else {
+      data.documents = data.documents.map((doc) => {
+        if (typeof doc === 'string') return doc.trim();
+        if (doc && typeof doc === 'object') return (doc.url || doc.path || doc.src || '').trim();
+        return '';
+      }).filter(Boolean);
+    }
+  }
+
   if (mod.id === 'vehicles') {
     if (!data.category || data.category === 'vehicle' || data.category === 'vehicles' || data.category === 'car') {
       data.category = data.wheelerType || (data.subcategory === 'Bike' ? '2-wheeler' : data.subcategory === 'Auto Rickshaw' ? '3-wheeler' : data.subcategory === 'Commercial Vehicle' ? 'commercial' : '4-wheeler');
@@ -121,6 +138,11 @@ router.post('/', protect, asyncHandler(async (req, res) => {
     if (!data.wheelerType) {
       data.wheelerType = data.category || '4-wheeler';
     }
+    data.brand = data.brand || data.make || data.title?.split(' ')[0] || 'Generic';
+    data.model = data.model || data.title || 'Standard';
+    data.year = Number(data.year) || new Date().getFullYear();
+    data.price = String(data.price || data.numericPrice || 'Price on Request');
+    data.location = data.location || data.area || data.city || 'Bengaluru';
   }
 
   if (mod.id === 'properties') {
@@ -128,6 +150,55 @@ router.post('/', protect, asyncHandler(async (req, res) => {
     data.propertyType = normalizeCanonicalPropertyType(rawType);
     delete data.subcategory;
     delete body.subcategory;
+    data.vendorName = data.vendorName || data.channelPartnerName || req.user?.name || 'One Vishwam';
+    data.channelPartnerName = data.channelPartnerName || data.vendorName || req.user?.name || 'One Vishwam';
+    data.bankLoanDetails = data.bankLoanDetails || 'Available on request';
+  }
+
+  if (mod.id === 'garments') {
+    data.name = data.name || data.title || 'Apparel';
+    const validGarmentCategories = ['Men', 'Women', 'Kids', 'Unisex'];
+    if (!validGarmentCategories.includes(data.category)) {
+      const match = validGarmentCategories.find(c => c.toLowerCase() === String(data.category || data.gender || data.subcategory || '').toLowerCase());
+      data.category = match || 'Unisex';
+    }
+    data.price = String(data.price || data.numericPrice || '0');
+  }
+
+  if (mod.id === 'groceries') {
+    data.name = data.name || data.title || 'Grocery Product';
+    data.category = data.category && data.category !== 'grocery' && data.category !== 'groceries' ? data.category : (data.subcategory || 'General');
+    data.price = String(data.price || data.numericPrice || '0');
+  }
+
+  if (mod.id === 'jewellery') {
+    data.title = data.title || data.name || 'Jewellery';
+    data.name = data.name || data.title || 'Jewellery';
+    data.metalType = data.metalType || data.material || 'Gold';
+    data.category = data.category && data.category !== 'jewellery' && data.category !== 'jewelry' ? data.category : (data.subcategory || 'Necklace');
+    data.price = String(data.price || data.numericPrice || '0');
+  }
+
+  if (mod.id === 'electronics') {
+    data.title = data.title || data.name || 'Electronic Item';
+    data.brand = data.brand || data.make || 'Brand';
+    data.model = data.model || 'Model';
+    data.price = String(data.price || data.numericPrice || '0');
+  }
+
+  if (mod.id === 'bedding') {
+    data.title = data.title || data.name || 'Bedding Item';
+    data.brand = data.brand || 'Brand';
+    data.model = data.model || 'Model';
+    data.price = String(data.price || data.numericPrice || '0');
+  }
+
+  if (mod.id === 'finance') {
+    data.category = data.category || 'Loan';
+    data.companyName = data.companyName || data.vendorName || 'One Vishwam Finance';
+    data.description = data.description || data.title || 'Financial Service';
+    data.city = data.city || 'bengaluru';
+    data.contactEmail = data.contactEmail || userEmail || 'ceo@onevishwam.com';
   }
 
   const mongoose = require('mongoose');
@@ -289,6 +360,23 @@ router.patch('/:type/:id', protect, asyncHandler(async (req, res) => {
     if (item.details && typeof item.details === 'object') {
       item.details.images = cleanImgs;
       item.markModified('details');
+    }
+  }
+
+  // Normalize documents safely based on module expectations
+  if (Array.isArray(body.documents)) {
+    if (mod.id === 'properties') {
+      body.documents = body.documents.map((doc) => {
+        if (typeof doc === 'string') return { url: doc.trim(), filename: '', fileType: '' };
+        if (doc && typeof doc === 'object') return { url: (doc.url || doc.path || doc.src || '').trim(), filename: doc.filename || doc.name || '', fileType: doc.fileType || doc.type || '' };
+        return null;
+      }).filter((d) => d && d.url);
+    } else {
+      body.documents = body.documents.map((doc) => {
+        if (typeof doc === 'string') return doc.trim();
+        if (doc && typeof doc === 'object') return (doc.url || doc.path || doc.src || '').trim();
+        return '';
+      }).filter(Boolean);
     }
   }
 

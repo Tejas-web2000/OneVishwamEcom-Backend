@@ -252,6 +252,24 @@ const propertySchema = new mongoose.Schema(
     documents: {
       type: [documentItemSchema],
       default: [],
+      set: (docs) => {
+        if (!Array.isArray(docs)) return [];
+        return docs
+          .map((doc) => {
+            if (typeof doc === 'string') {
+              return { url: doc.trim(), filename: '', fileType: '' };
+            }
+            if (doc && typeof doc === 'object') {
+              return {
+                url: (doc.url || doc.path || doc.src || '').trim(),
+                filename: doc.filename || doc.name || '',
+                fileType: doc.fileType || doc.type || '',
+              };
+            }
+            return null;
+          })
+          .filter((d) => d && d.url);
+      },
     },
     images: {
       type: [String],
