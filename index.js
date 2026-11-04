@@ -1,13 +1,6 @@
 const { onRequest } = require("firebase-functions/v2/https");
 const { setGlobalOptions } = require("firebase-functions/v2");
 const functions = require("firebase-functions/v1");
-require("dotenv").config();
-
-// Import configured Express application and database
-const app = require("./app");
-const connectDB = require("./config/db");
-const User = require("./models/User");
-
 
 // Global options for 2nd Gen Firebase Functions
 setGlobalOptions({
@@ -20,11 +13,23 @@ setGlobalOptions({
 /**
  * Cloud Function entrypoint (Gen 2) for OneVishwam Express Backend.
  * Region: asia-south1 (Mumbai) gives optimal low latency to users in India.
- * Memory: 256MiB, CPU: 0.25 fractional vCPU, concurrency: 80 to maximize
+ * Memory: 1GiB, CPU: 1 vCPU, concurrency: 80 to maximize
  * multiplexed request handling per container inside zero-cost quotas.
  * minInstances: 0 prevents any idle compute billing.
  * Secret: MONGODB_URI bound via Google Cloud Secret Manager for production security.
+ *
+ * NOTE: Express application is lazily loaded on first request to prevent
+ * Firebase CLI deployment timeouts during trigger analysis (<1s discovery).
  */
+let expressApp;
+function getApp() {
+  if (!expressApp) {
+    require("dotenv").config();
+    expressApp = require("./app");
+  }
+  return expressApp;
+}
+
 exports.api = onRequest(
   {
     region: "asia-south1",
@@ -36,7 +41,9 @@ exports.api = onRequest(
     timeoutSeconds: 60,
     secrets: ["MONGODB_URI"],
   },
-  app
+  (req, res) => {
+    return getApp()(req, res);
+  }
 );
 
 /**
@@ -53,6 +60,10 @@ exports.cleanupDeletedUser = functions
   .auth.user()
   .onDelete(async (user) => {
     try {
+      require("dotenv").config();
+      const connectDB = require("./config/db");
+      const User = require("./models/User");
+
       await connectDB();
       const query = {
         $or: [{ firebaseUid: user.uid }],
